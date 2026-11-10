@@ -1,0 +1,11 @@
+# Все поля — открытые решения пользователя. Пока хоть одно null, режимы кроме
+# signals_only запрещены (см. app.yaml).
+risk_per_trade_pct: null
+max_leverage: null
+daily_loss_limit_pct: null
+weekly_loss_limit_pct: null
+stop_buffer_atr: null
+min_stop_atr: null
+max_stop_atr: null
+position_mode: null   # hedge | one_way
+margin_mode: null     # isolated | cross

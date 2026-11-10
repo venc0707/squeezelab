@@ -1,0 +1,31 @@
+# Пресеты детектора поджимов. Параметры совпадают с Pine-скриптом «Williams percent range».
+# Блок x-common — общие параметры (ключи «x-...» загрузчик отбрасывает); отличаются только
+# level, max_slope и max_len. priority — открытое решение (приоритет при совпадении пресетов).
+x-common: &common
+  tf: 15m
+  length: 500
+  source: close
+  min_dist: 5
+  min_in: 1
+  gap_tol: 2
+  min_touches: 3
+  min_depth: 2
+  max_depth: 25
+  min_grow: 2
+  tol: 1
+  squeeze_upper: true   # поджим к верхней зоне (растущие лои, пробой вниз = шорт)
+  squeeze_lower: true   # поджим к нижней зоне (падающие хаи, пробой вверх = лонг)
+
+presets:
+  lvl6:
+    <<: *common
+    level: 6
+    max_slope: 25
+    max_len: 250
+    priority: null
+  lvl3:
+    <<: *common
+    level: 3
+    max_slope: 22
+    max_len: 300
+    priority: null

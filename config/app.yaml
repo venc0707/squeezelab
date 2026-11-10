@@ -1,0 +1,8 @@
+# Режим работы: signals_only | backtest | paper_vst | live.
+# Всё, кроме signals_only, запрещено, пока в risk.yaml и exits.yaml есть null.
+mode: signals_only
+timezone: UTC
+paths:
+  data_dir: data
+  logs_dir: logs
+log_level: INFO

@@ -1,0 +1,7 @@
+# data_start — первый день анализируемого периода (UTC).
+# warmup_bars — прогрев перед ним (период %R = 500).
+symbols:
+  - symbol: BNB-USDT
+    tf: 15m
+    data_start: 2026-07-01
+    warmup_bars: 500
