@@ -1,0 +1,31 @@
+# секреты
+.env
+.env.*
+!.env.example
+
+# данные и артефакты (якоря «/», чтобы не задеть пакет src/squeezelab/data)
+/data/
+/logs/
+*.parquet
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Python и инструменты
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# редакторы и ОС
+.idea/
+.vscode/
+.DS_Store
