@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from squeezelab import __version__
+from squeezelab.app.logging_setup import configure_logging
 from squeezelab.app.settings import (
     ConfigError,
     ProjectConfig,
@@ -19,6 +20,7 @@ from squeezelab.app.settings import (
     load_secrets,
     resolve_config_dir,
 )
+from squeezelab.notify.telegram import TelegramClient, TelegramError, build_test_message
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -57,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
         "check", parents=[common], help="проверить конфиги и напечатать хэш"
     ).set_defaults(handler=cmd_config_check)
 
+    notify = sub.add_parser(
+        "notify-test",
+        parents=[common],
+        help="отправить тестовое сообщение в Telegram (только в чаты из белого списка)",
+    )
+    notify.add_argument(
+        "--dry-run", action="store_true", help="показать сообщение и адресатов, ничего не отправляя"
+    )
+    notify.set_defaults(handler=cmd_notify_test)
+
     return parser
 
 
@@ -91,6 +103,43 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     for name, present in secrets.presence().items():
         print(f"  {name}: {'задан' if present else 'не задан'}")
     return EXIT_OK
+
+
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        secrets = load_secrets(args.env_file)
+    except ConfigError as exc:
+        print(f"Конфиг: ОШИБКА\n{exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level, secrets.secret_values())
+
+    if secrets.telegram_bot_token is None or not secrets.telegram_chat_ids:
+        print(
+            "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_IDS должны быть заданы в .env "
+            "(инструкция: docs/runbook.md, раздел Telegram)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    text = build_test_message(cfg.app.mode.value, config_hash(cfg))
+    if args.dry_run:
+        print("Сухой прогон, ничего не отправлено. Текст сообщения:\n")
+        print(text)
+        print(f"\nАдресаты (белый список): {', '.join(map(str, secrets.telegram_chat_ids))}")
+        return EXIT_OK
+
+    failed = False
+    with TelegramClient(secrets.telegram_bot_token, secrets.telegram_chat_ids) as client:
+        for chat_id in secrets.telegram_chat_ids:
+            try:
+                client.send_message(chat_id, text)
+            except TelegramError as exc:
+                failed = True
+                print(f"chat_id {chat_id}: ОШИБКА: {exc}", file=sys.stderr)
+            else:
+                print(f"chat_id {chat_id}: отправлено")
+    return EXIT_FAILURE if failed else EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
