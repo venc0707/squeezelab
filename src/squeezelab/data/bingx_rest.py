@@ -14,13 +14,21 @@ from types import TracebackType
 from typing import Any, Self
 
 import httpx
+from pydantic import SecretStr
 
 from squeezelab import __version__
+from squeezelab.app.logging_setup import redact
+from squeezelab.data.bingx_signing import API_KEY_HEADER, DEFAULT_RECV_WINDOW_MS, build_signed_query
 from squeezelab.data.models import Candle
 
 LIVE_BASE_URL = "https://open-api.bingx.com"
 VST_BASE_URL = "https://open-api-vst.bingx.com"
 KLINES_PATH = "/openApi/swap/v3/quote/klines"
+BALANCE_PATH = "/openApi/swap/v3/user/balance"
+API_PERMISSIONS_PATH = "/openApi/v1/account/apiPermissions"
+# Приватные запросы разрешены только к этим путям (только чтение). Торговых путей здесь нет
+# намеренно: добавление нового пути — осознанное изменение кода с проверкой.
+READ_ONLY_PATHS = frozenset({BALANCE_PATH, API_PERMISSIONS_PATH})
 
 # Интервалы из документации BingX (месяц «1M» не используем).
 VALID_INTERVALS = frozenset(
@@ -191,7 +199,7 @@ class BingXPublicClient:
                 continue
             return response
         raise BingXRequestError(
-            f"сеть недоступна: {self._max_retries + 1} попыток не удались ({last_error}); "
+            f"сеть недоступна: все попытки ({self._max_retries + 1}) не удались ({last_error}); "
             "проверь интернет, DNS и доступность open-api.bingx.com"
         )
 
@@ -236,3 +244,145 @@ class BingXPublicClient:
         return self.fetch_klines(
             symbol, interval, limit, start_time=start_time, end_time=end_time
         ).candles
+
+
+# ----------------------------------------------------------------- приватное чтение
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceSummary:
+    assets: list[str]
+    shown_asset: str | None  # актив, по которому есть поля ниже
+    fields: dict[str, str]  # balance / equity / availableMargin, если биржа их вернула
+
+
+def summarize_balance(data: object) -> BalanceSummary:
+    """Приводит ответ баланса к краткой сводке. Понимает список активов и одиночный объект.
+
+    Форма ответа подтверждена только документацией и сторонними SDK, поэтому разбор осторожный.
+    """
+    items: list[dict[str, Any]]
+    if isinstance(data, list):
+        items = [item for item in data if isinstance(item, dict)]
+    elif isinstance(data, dict) and isinstance(data.get("balance"), dict):
+        items = [data["balance"]]
+    elif isinstance(data, dict) and "asset" in data:
+        items = [data]
+    else:
+        raise BingXParseError(f"баланс: неожиданная форма данных ({type(data).__name__})")
+    if not items:
+        raise BingXParseError("баланс: пустой список активов")
+    assets = [str(item.get("asset", "?")) for item in items]
+    chosen = next(
+        (it for want in ("USDT", "VST") for it in items if it.get("asset") == want), items[0]
+    )
+    fields: dict[str, str] = {
+        key: str(chosen[key]) for key in ("balance", "equity", "availableMargin") if key in chosen
+    }
+    return BalanceSummary(assets, str(chosen.get("asset", "?")), fields)
+
+
+_RISKY_PERMISSION_WORDS = ("withdraw", "trad", "transfer")
+
+
+def risky_permissions(data: object) -> list[str]:
+    """Имена включённых флагов, похожих на торговлю, вывод или перевод (эвристика по именам)."""
+    if not isinstance(data, dict):
+        return []
+    return [
+        str(name)
+        for name, value in data.items()
+        if isinstance(value, bool | int)
+        and value
+        and any(word in str(name).lower() for word in _RISKY_PERMISSION_WORDS)
+    ]
+
+
+def permission_flags(data: object) -> dict[str, bool | int]:
+    """Только булевы и целые флаги: строки (в них может быть сам ключ) не показываем."""
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, bool | int)}
+
+
+class BingXReadOnlyClient:
+    """Подписанные GET-запросы к разрешённым путям (баланс, права ключа). Без ретраев.
+
+    Каждая попытка — новый timestamp, поэтому повтор делает вызывающий код осознанно.
+    """
+
+    def __init__(
+        self,
+        api_key: SecretStr,
+        api_secret: SecretStr,
+        base_url: str,
+        *,
+        timeout: float = 10.0,
+        recv_window_ms: int = DEFAULT_RECV_WINDOW_MS,
+        transport: httpx.BaseTransport | None = None,
+        now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    ) -> None:
+        self._key = api_key
+        self._secret = api_secret
+        self._recv_window_ms = recv_window_ms
+        self._now_ms = now_ms
+        self._http = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
+            headers={"User-Agent": f"squeezelab/{__version__}"},
+            transport=transport,
+        )
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._http.close()
+
+    def _clean(self, text: str) -> str:
+        return redact(text, [self._key.get_secret_value(), self._secret.get_secret_value()])
+
+    def signed_get(self, path: str, params: Mapping[str, str | int] | None = None) -> Any:
+        if path not in READ_ONLY_PATHS:
+            raise ValueError(f"путь {path!r} не входит в список разрешённых для чтения")
+        query = build_signed_query(
+            params or {},
+            self._secret.get_secret_value(),
+            timestamp_ms=self._now_ms(),
+            recv_window_ms=self._recv_window_ms,
+        )
+        try:
+            response = self._http.get(
+                f"{path}?{query}", headers={API_KEY_HEADER: self._key.get_secret_value()}
+            )
+        except httpx.HTTPError as exc:
+            raise BingXRequestError(
+                f"сеть недоступна или таймаут ({type(exc).__name__}); проверь интернет, DNS и "
+                "адрес API"
+            ) from None
+        if response.status_code != 200:
+            raise BingXHTTPError(response.status_code, self._clean(_excerpt(response.text)))
+        try:
+            payload = json.loads(response.text)
+        except ValueError:
+            raise BingXParseError(
+                f"ответ не JSON: {self._clean(_excerpt(response.text))}"
+            ) from None
+        try:
+            return unwrap_envelope(payload)
+        except BingXAPIError as exc:
+            raise BingXAPIError(exc.code, self._clean(exc.msg)) from None
+
+    def fetch_balance(self) -> BalanceSummary:
+        return summarize_balance(self.signed_get(BALANCE_PATH))
+
+    def fetch_api_permissions(self) -> Any:
+        return self.signed_get(API_PERMISSIONS_PATH)

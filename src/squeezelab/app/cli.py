@@ -23,8 +23,12 @@ from squeezelab.app.settings import (
 )
 from squeezelab.data.bingx_rest import (
     LIVE_BASE_URL,
+    VST_BASE_URL,
     BingXError,
     BingXPublicClient,
+    BingXReadOnlyClient,
+    permission_flags,
+    risky_permissions,
 )
 from squeezelab.data.models import (
     detect_order,
@@ -95,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-raw", type=Path, default=None, help="сохранить сырой JSON-ответ в этот файл"
     )
     smoke.set_defaults(handler=cmd_bingx_smoke)
+
+    auth = sub.add_parser(
+        "bingx-auth-check",
+        parents=[common],
+        help="один подписанный запрос только на чтение (баланс) в окружении BINGX_ENV",
+    )
+    auth.add_argument(
+        "--show-balance",
+        action="store_true",
+        help="показать суммы и для боевого окружения (для vst суммы показываются всегда)",
+    )
+    auth.set_defaults(handler=cmd_bingx_auth_check)
 
     return parser
 
@@ -230,6 +246,77 @@ def cmd_bingx_smoke(args: argparse.Namespace) -> int:
         args.save_raw.parent.mkdir(parents=True, exist_ok=True)
         args.save_raw.write_text(result.raw_text, encoding="utf-8")
         print(f"Сырой ответ сохранён: {args.save_raw}")
+    return EXIT_OK
+
+
+def _mask_key(key: str) -> str:
+    return f"{key[:4]}…{key[-4:]}" if len(key) >= 12 else "***"
+
+
+_AUTH_HINTS = (
+    "Что проверить:\n"
+    "  1. BINGX_API_KEY и BINGX_API_SECRET в .env без кавычек и пробелов;\n"
+    "  2. BINGX_ENV совпадает с окружением, где создан ключ (vst или live);\n"
+    "  3. если включена привязка к IP, текущий внешний IP этой машины есть в списке;\n"
+    "  4. время на компьютере синхронизировано (окно подписи 5000 мс);\n"
+    "  5. у ключа включено чтение."
+)
+
+
+def cmd_bingx_auth_check(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        secrets = load_secrets(args.env_file)
+    except ConfigError as exc:
+        print(f"Конфиг: ОШИБКА\n{exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level, secrets.secret_values())
+
+    if secrets.bingx_api_key is None or secrets.bingx_api_secret is None:
+        print(
+            "BINGX_API_KEY и BINGX_API_SECRET должны быть заданы в .env "
+            "(инструкция: docs/runbook.md, раздел BingX)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    base_url = VST_BASE_URL if secrets.bingx_env == "vst" else LIVE_BASE_URL
+    print(f"Окружение: {secrets.bingx_env} ({base_url})")
+    print(f"Ключ: {_mask_key(secrets.bingx_api_key.get_secret_value())}")
+    if secrets.bingx_env == "live":
+        print("Боевой контур: выполняются только запросы на чтение.")
+
+    show_amounts = secrets.bingx_env == "vst" or args.show_balance
+    with BingXReadOnlyClient(secrets.bingx_api_key, secrets.bingx_api_secret, base_url) as client:
+        try:
+            balance = client.fetch_balance()
+        except BingXError as exc:
+            print(f"Подписанный запрос: ОШИБКА: {exc}", file=sys.stderr)
+            print(_AUTH_HINTS, file=sys.stderr)
+            return EXIT_FAILURE
+        print("Подписанный запрос (баланс): OK, подпись принята")
+        print(f"Активов в ответе: {len(balance.assets)} ({', '.join(balance.assets)})")
+        if balance.fields and show_amounts:
+            details = ", ".join(f"{k}={v}" for k, v in balance.fields.items())
+            print(f"Актив {balance.shown_asset}: {details}")
+        elif balance.fields:
+            print("Суммы скрыты (добавь --show-balance, чтобы показать).")
+
+        try:
+            permissions = client.fetch_api_permissions()
+        except BingXError as exc:
+            print(f"Права ключа: проверить не удалось ({exc}); эндпоинт не подтверждён.")
+        else:
+            flags = permission_flags(permissions)
+            print(f"Права ключа (флаги из ответа): {flags or 'формат не распознан'}")
+            risky = risky_permissions(permissions)
+            if risky:
+                print(
+                    "ВНИМАНИЕ: у ключа включены права, похожие на торговлю, перевод или вывод: "
+                    + ", ".join(risky)
+                    + ". Для Phase 00 нужен ключ только на чтение: пересоздай ключ.",
+                    file=sys.stderr,
+                )
     return EXIT_OK
 
 
