@@ -22,6 +22,8 @@ from squeezelab.data.bingx_rest import (
     BingXParseError,
     BingXReadOnlyClient,
     BingXRequestError,
+    describe_shape,
+    extract_permissions,
     permission_flags,
     risky_permissions,
     summarize_balance,
@@ -388,3 +390,60 @@ def test_cli_without_credentials(
     code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(empty)])
     assert code == 2
     assert "BINGX_API_KEY" in capsys.readouterr().err
+
+
+# ------------------------------------- права ключа: ответ без поля code (как на VST)
+
+
+def test_extract_permissions_accepts_three_shapes() -> None:
+    flags = {"permitsEnableReading": True}
+    assert extract_permissions({"code": 0, "data": flags}) == flags
+    assert extract_permissions({"data": flags, "success": True}) == flags
+    assert extract_permissions(flags) == flags
+    assert extract_permissions("text") == "text"
+
+
+def test_extract_permissions_reports_api_error() -> None:
+    with pytest.raises(BingXAPIError):
+        extract_permissions({"code": 100001, "msg": "bad"})
+
+
+def test_describe_shape_never_shows_values() -> None:
+    payload = {"apiKey": KEY, "flags": {"a": True, "b": 1}, "items": [1, 2], "n": None}
+    shape = describe_shape(payload)
+    assert KEY not in shape
+    assert "apiKey: str" in shape
+    assert "a: bool" in shape
+    assert "items: list[2]" in shape
+    assert describe_shape({"x": {"y": {"z": 1}}}, depth=2) == "{x: {y: dict}}"
+
+
+def test_signed_get_json_returns_payload_as_is() -> None:
+    body = {"success": True, "data": {"permitsEnableReading": True}}
+    with _client(httpx.MockTransport(lambda _r: httpx.Response(200, json=body))) as client:
+        assert client.fetch_api_permissions() == body
+
+
+def test_cli_handles_permissions_response_without_code(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch)
+    body = {"apiKey": KEY, "permitsEnableReading": True, "permitsEnableFutures": False}
+    _patch_transport(monkeypatch, _router_raw(body))
+    code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "проверить не удалось" not in captured.out
+    assert "'permitsEnableReading': True" in captured.out
+    assert "Форма ответа (только имена и типы)" in captured.out
+    assert "apiKey: str" in captured.out
+    assert KEY not in captured.out + captured.err
+
+
+def _router_raw(permissions_payload: object) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == BALANCE_PATH:
+            return httpx.Response(200, json=BALANCE_LIST)
+        return httpx.Response(200, json=permissions_payload)
+
+    return httpx.MockTransport(handler)

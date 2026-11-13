@@ -298,6 +298,31 @@ def risky_permissions(data: object) -> list[str]:
     ]
 
 
+def extract_permissions(payload: object) -> object:
+    """Достаёт данные о правах из ответа любой из трёх форм: конверт {code, data}, объект
+    {data: {...}} без code или плоский объект. Форма реального ответа подтверждена частично
+    (поля code нет), поэтому разбор терпимый. Код ошибки в конверте — BingXAPIError."""
+    if isinstance(payload, dict):
+        if "code" in payload:
+            return unwrap_envelope(payload)
+        if isinstance(payload.get("data"), dict):
+            return payload["data"]
+    return payload
+
+
+def describe_shape(payload: object, depth: int = 2) -> str:
+    """Форма ответа: только имена полей и типы значений, сами значения не показываются
+    (в них может быть ключ API)."""
+    if isinstance(payload, dict):
+        if depth <= 0:
+            return "dict"
+        inner = ", ".join(f"{k}: {describe_shape(v, depth - 1)}" for k, v in payload.items())
+        return "{" + inner + "}"
+    if isinstance(payload, list):
+        return f"list[{len(payload)}]"
+    return type(payload).__name__
+
+
 def permission_flags(data: object) -> dict[str, bool | int]:
     """Только булевы и целые флаги: строки (в них может быть сам ключ) не показываем."""
     if not isinstance(data, dict):
@@ -350,7 +375,8 @@ class BingXReadOnlyClient:
     def _clean(self, text: str) -> str:
         return redact(text, [self._key.get_secret_value(), self._secret.get_secret_value()])
 
-    def signed_get(self, path: str, params: Mapping[str, str | int] | None = None) -> Any:
+    def signed_get_json(self, path: str, params: Mapping[str, str | int] | None = None) -> Any:
+        """Подписанный GET; возвращает разобранный JSON как есть, без разбора конверта."""
         if path not in READ_ONLY_PATHS:
             raise ValueError(f"путь {path!r} не входит в список разрешённых для чтения")
         query = build_signed_query(
@@ -376,8 +402,12 @@ class BingXReadOnlyClient:
             raise BingXParseError(
                 f"ответ не JSON: {self._clean(_excerpt(response.text))}"
             ) from None
+        return payload
+
+    def signed_get(self, path: str, params: Mapping[str, str | int] | None = None) -> Any:
+        """Подписанный GET с проверкой конверта {code, msg, data}; возвращает data."""
         try:
-            return unwrap_envelope(payload)
+            return unwrap_envelope(self.signed_get_json(path, params))
         except BingXAPIError as exc:
             raise BingXAPIError(exc.code, self._clean(exc.msg)) from None
 
@@ -385,4 +415,5 @@ class BingXReadOnlyClient:
         return summarize_balance(self.signed_get(BALANCE_PATH))
 
     def fetch_api_permissions(self) -> Any:
-        return self.signed_get(API_PERMISSIONS_PATH)
+        """Сырой ответ эндпоинта прав: на VST он пришёл без поля code (проверено запросом)."""
+        return self.signed_get_json(API_PERMISSIONS_PATH)

@@ -27,6 +27,8 @@ from squeezelab.data.bingx_rest import (
     BingXError,
     BingXPublicClient,
     BingXReadOnlyClient,
+    describe_shape,
+    extract_permissions,
     permission_flags,
     risky_permissions,
 )
@@ -303,12 +305,14 @@ def cmd_bingx_auth_check(args: argparse.Namespace) -> int:
             print("Суммы скрыты (добавь --show-balance, чтобы показать).")
 
         try:
-            permissions = client.fetch_api_permissions()
+            payload = client.fetch_api_permissions()
+            permissions = extract_permissions(payload)
         except BingXError as exc:
             print(f"Права ключа: проверить не удалось ({exc}); эндпоинт не подтверждён.")
         else:
             flags = permission_flags(permissions)
-            print(f"Права ключа (флаги из ответа): {flags or 'формат не распознан'}")
+            print(f"Права ключа (флаги из ответа): {flags or 'флагов не найдено'}")
+            print(f"Форма ответа (только имена и типы): {describe_shape(payload)}")
             risky = risky_permissions(permissions)
             if risky:
                 print(
