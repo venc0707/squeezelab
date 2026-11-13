@@ -29,7 +29,8 @@ from squeezelab.data.bingx_rest import (
     BingXReadOnlyClient,
     describe_shape,
     extract_permissions,
-    permission_flags,
+    permission_fields,
+    permissions_differ_from_reference,
     risky_permissions,
 )
 from squeezelab.data.models import (
@@ -246,7 +247,9 @@ def cmd_bingx_smoke(args: argparse.Namespace) -> int:
         print("Заголовки лимитов: в ответе не обнаружено")
     if args.save_raw is not None:
         args.save_raw.parent.mkdir(parents=True, exist_ok=True)
-        args.save_raw.write_text(result.raw_text, encoding="utf-8")
+        # Завершающий перевод строки нужен, чтобы хук end-of-file-fixer не менял файл при коммите.
+        raw_text = result.raw_text if result.raw_text.endswith("\n") else result.raw_text + "\n"
+        args.save_raw.write_text(raw_text, encoding="utf-8")
         print(f"Сырой ответ сохранён: {args.save_raw}")
     return EXIT_OK
 
@@ -310,17 +313,24 @@ def cmd_bingx_auth_check(args: argparse.Namespace) -> int:
         except BingXError as exc:
             print(f"Права ключа: проверить не удалось ({exc}); эндпоинт не подтверждён.")
         else:
-            flags = permission_flags(permissions)
-            print(f"Права ключа (флаги из ответа): {flags or 'флагов не найдено'}")
+            fields = permission_fields(permissions)
+            print(f"Права ключа (поля из ответа): {fields or 'полей не найдено'}")
+            if "ipAddresses" in fields:
+                ips = fields["ipAddresses"]
+                bound = ips != [] and ips != "list[0]"
+                print(f"Привязка к IP (ipAddresses): {'есть' if bound else 'нет адресов'}")
             print(f"Форма ответа (только имена и типы): {describe_shape(payload)}")
+            warnings = []
             risky = risky_permissions(permissions)
             if risky:
-                print(
-                    "ВНИМАНИЕ: у ключа включены права, похожие на торговлю, перевод или вывод: "
-                    + ", ".join(risky)
-                    + ". Для Phase 00 нужен ключ только на чтение: пересоздай ключ.",
-                    file=sys.stderr,
+                warnings.append(
+                    "включены права, похожие на торговлю, перевод или вывод: " + ", ".join(risky)
                 )
+            differs = permissions_differ_from_reference(permissions)
+            if differs:
+                warnings.append(differs)
+            for warning in warnings:
+                print(f"ВНИМАНИЕ: {warning}", file=sys.stderr)
     return EXIT_OK
 
 

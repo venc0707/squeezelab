@@ -307,6 +307,30 @@ def test_non_json_body_is_parse_error() -> None:
         client.get_klines("BNB-USDT", "15m")
 
 
+def test_limit_above_exchange_maximum_is_rejected_locally() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=_sample_payload())
+
+    with _client(httpx.MockTransport(handler), []) as client:
+        with pytest.raises(ValueError, match="1440"):
+            client.get_klines("BNB-USDT", "15m", 1441)
+        client.get_klines("BNB-USDT", "15m", 1440)
+    assert calls == 1
+
+
+def test_exchange_validation_error_format_seen_in_real_run() -> None:
+    body = {"code": 109400, "msg": "limit: This field must be less than or equal to 1440. "}
+    transport = httpx.MockTransport(lambda _r: httpx.Response(200, json=body))
+    with _client(transport, []) as client, pytest.raises(BingXAPIError) as exc:
+        client.get_klines("BNB-USDT", "15m", 20)
+    assert exc.value.code == 109400
+    assert "1440" in exc.value.msg
+
+
 def test_argument_validation() -> None:
     with _client(httpx.MockTransport(lambda _r: httpx.Response(200)), []) as client:
         with pytest.raises(ValueError, match="интервал"):
@@ -342,7 +366,10 @@ def test_smoke_prints_report_and_saves_raw(
     assert "закрыта: да" in out  # образец в прошлом относительно текущего времени
     assert "Без пропусков и дублей: да" in out
     assert "Символ: BNB-USDT, интервал: 15m" in out
-    assert json.loads(raw.read_text(encoding="utf-8"))["code"] == 0
+    saved = raw.read_text(encoding="utf-8")
+    assert saved.endswith("\n")
+    assert not saved.endswith("\n\n")
+    assert json.loads(saved)["code"] == 0
 
 
 def test_smoke_flags_unclosed_newest_candle(

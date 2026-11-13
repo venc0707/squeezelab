@@ -88,9 +88,19 @@ def test_exits_and_symbols_match_agreed_decisions() -> None:
     )
 
 
-def test_all_risk_fields_are_null() -> None:
-    cfg = load_project_config(REPO_CONFIG)
-    assert len(cfg.risk.unresolved()) == 9
+def test_open_and_closed_risk_decisions() -> None:
+    risk = load_project_config(REPO_CONFIG).risk
+    assert risk.position_mode == "one_way"  # D-04, решение пользователя 2026-11-13
+    assert risk.margin_mode == "isolated"  # D-05, решение пользователя 2026-11-13
+    assert set(risk.unresolved()) == {
+        "risk_per_trade_pct",
+        "max_leverage",
+        "daily_loss_limit_pct",
+        "weekly_loss_limit_pct",
+        "stop_buffer_atr",
+        "min_stop_atr",
+        "max_stop_atr",
+    }
 
 
 # ------------------------------------------------------------------ ошибки валидации
@@ -124,7 +134,9 @@ def test_max_depth_over_100_and_min_touches_below_3(cfg_dir: Path) -> None:
 
 
 def test_unknown_key_is_rejected(cfg_dir: Path) -> None:
-    _edit(cfg_dir, "risk.yaml", "margin_mode: null", "margin_mode: null\nmargin_modee: null")
+    _edit(
+        cfg_dir, "risk.yaml", "margin_mode: isolated", "margin_mode: isolated\nmargin_modee: null"
+    )
     with pytest.raises(ConfigError, match="margin_modee"):
         load_project_config(cfg_dir)
 
@@ -335,7 +347,7 @@ def test_cli_config_check_ok(capsys: pytest.CaptureFixture[str], tmp_path: Path)
     assert code == 0
     assert "Конфиг: OK" in out
     assert config_hash(load_project_config(REPO_CONFIG)) in out
-    assert "Открытые решения (null): 13" in out
+    assert "Открытые решения (null): 11" in out
 
 
 def test_cli_config_check_fails_on_broken_config(

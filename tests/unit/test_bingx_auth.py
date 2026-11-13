@@ -24,7 +24,8 @@ from squeezelab.data.bingx_rest import (
     BingXRequestError,
     describe_shape,
     extract_permissions,
-    permission_flags,
+    permission_fields,
+    permissions_differ_from_reference,
     risky_permissions,
     summarize_balance,
 )
@@ -249,11 +250,35 @@ def test_permission_helpers() -> None:
         "apiKey": KEY,
     }
     assert risky_permissions(data) == ["permitsEnableSpotAndMarginTrade"]
-    assert "apiKey" not in permission_flags(data)
-    assert permission_flags(data)["ipRestrict"] is True
+    assert "apiKey" not in permission_fields(data)
+    assert permission_fields(data)["ipRestrict"] is True
     assert risky_permissions({"permitsEnableWithdraw": True}) == ["permitsEnableWithdraw"]
     assert risky_permissions("text") == []
-    assert permission_flags(None) == {}
+    assert permission_fields(None) == {}
+
+
+# Реальная форма ответа apiPermissions на VST (проверено запросом 2026-11-13)
+REAL_PERMISSIONS = {"permissions": [1], "ipAddresses": [], "note": "my note", "apiKey": KEY}
+
+
+def test_permission_fields_real_shape() -> None:
+    fields = permission_fields(REAL_PERMISSIONS)
+    assert fields == {"permissions": [1], "ipAddresses": []}
+    assert "note" not in fields
+    assert "apiKey" not in fields
+    assert permission_fields({"ipAddresses": ["1.2.3.4", "5.6.7.8"]}) == {"ipAddresses": "list[2]"}
+
+
+def test_reference_comparison() -> None:
+    assert permissions_differ_from_reference(REAL_PERMISSIONS) is None
+    assert permissions_differ_from_reference({"permissions": [1, 1]}) is None
+    message = permissions_differ_from_reference({"permissions": [1, 3]})
+    assert message is not None
+    assert "[1, 3]" in message
+    assert "вручную" in message
+    assert permissions_differ_from_reference({"permissions": []}) is not None
+    assert permissions_differ_from_reference({"other": 1}) is None
+    assert permissions_differ_from_reference("text") is None
 
 
 # ---------------------------------------------------------------- команда CLI
@@ -447,3 +472,33 @@ def _router_raw(permissions_payload: object) -> httpx.MockTransport:
         return httpx.Response(200, json=permissions_payload)
 
     return httpx.MockTransport(handler)
+
+
+def test_cli_real_permissions_shape_reports_ip_and_no_warning(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch)
+    _patch_transport(monkeypatch, _router_raw(REAL_PERMISSIONS))
+    code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "{'permissions': [1], 'ipAddresses': []}" in captured.out
+    assert "Привязка к IP (ipAddresses): нет адресов" in captured.out
+    assert "ВНИМАНИЕ" not in captured.err
+    assert "my note" not in captured.out
+    assert KEY not in captured.out + captured.err
+
+
+def test_cli_warns_when_permissions_differ_from_reference(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch)
+    payload = {"permissions": [1, 3], "ipAddresses": ["203.0.113.7"]}
+    _patch_transport(monkeypatch, _router_raw(payload))
+    code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "ВНИМАНИЕ" in captured.err
+    assert "[1, 3]" in captured.err
+    assert "Привязка к IP (ipAddresses): есть" in captured.out
+    assert "203.0.113.7" not in captured.out + captured.err

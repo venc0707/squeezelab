@@ -34,6 +34,7 @@ READ_ONLY_PATHS = frozenset({BALANCE_PATH, API_PERMISSIONS_PATH})
 VALID_INTERVALS = frozenset(
     {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 )
+MAX_KLINES_LIMIT = 1440  # проверено запросом: выше биржа отвечает code=109400
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_DELAY_S = 30.0
 _MAX_RETRY_AFTER_S = 60.0
@@ -216,6 +217,8 @@ class BingXPublicClient:
             raise ValueError(f"интервал {interval!r} не из списка {sorted(VALID_INTERVALS)}")
         if limit < 1:
             raise ValueError("limit должен быть не меньше 1")
+        if limit > MAX_KLINES_LIMIT:
+            raise ValueError(f"limit не может быть больше {MAX_KLINES_LIMIT} (ограничение BingX)")
         params: dict[str, str | int] = {"symbol": symbol, "interval": interval, "limit": limit}
         if start_time is not None:
             params["startTime"] = start_time
@@ -323,11 +326,41 @@ def describe_shape(payload: object, depth: int = 2) -> str:
     return type(payload).__name__
 
 
-def permission_flags(data: object) -> dict[str, bool | int]:
-    """Только булевы и целые флаги: строки (в них может быть сам ключ) не показываем."""
+# Эмпирический эталон: так выглядит ответ для ключа с одним правом «чтение» (одно наблюдение,
+# 2026-11-13, права подтверждены вручную в API Management). Значения кодов в документации не
+# сверялись, поэтому любое другое значение — повод проверить права вручную, а не вывод о рисках.
+READ_ONLY_PERMISSIONS_REFERENCE = [1]
+
+
+def permission_fields(data: object) -> dict[str, object]:
+    """Поля ответа о правах, безопасные для показа: булевы и целые значения, списки целых
+    (так выглядит `permissions`), для остальных списков только длина. Строки (в них бывает
+    сам ключ) не показываются."""
     if not isinstance(data, dict):
         return {}
-    return {str(k): v for k, v in data.items() if isinstance(v, bool | int)}
+    result: dict[str, object] = {}
+    for name, value in data.items():
+        if isinstance(value, bool | int):
+            result[str(name)] = value
+        elif isinstance(value, list):
+            ints = all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+            result[str(name)] = value if ints else f"list[{len(value)}]"
+    return result
+
+
+def permissions_differ_from_reference(data: object) -> str | None:
+    """Сообщение, если список `permissions` отличается от эталона ключа только на чтение."""
+    if not isinstance(data, dict):
+        return None
+    perms = data.get("permissions")
+    if not isinstance(perms, list) or not all(isinstance(x, int) for x in perms):
+        return None
+    if sorted(set(perms)) == READ_ONLY_PERMISSIONS_REFERENCE:
+        return None
+    return (
+        f"permissions={perms}, у ключа только на чтение было {READ_ONLY_PERMISSIONS_REFERENCE}: "
+        "проверь права ключа вручную в API Management"
+    )
 
 
 class BingXReadOnlyClient:
