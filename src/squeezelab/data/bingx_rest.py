@@ -285,22 +285,6 @@ def summarize_balance(data: object) -> BalanceSummary:
     return BalanceSummary(assets, str(chosen.get("asset", "?")), fields)
 
 
-_RISKY_PERMISSION_WORDS = ("withdraw", "trad", "transfer")
-
-
-def risky_permissions(data: object) -> list[str]:
-    """Имена включённых флагов, похожих на торговлю, вывод или перевод (эвристика по именам)."""
-    if not isinstance(data, dict):
-        return []
-    return [
-        str(name)
-        for name, value in data.items()
-        if isinstance(value, bool | int)
-        and value
-        and any(word in str(name).lower() for word in _RISKY_PERMISSION_WORDS)
-    ]
-
-
 def extract_permissions(payload: object) -> object:
     """Достаёт данные о правах из ответа любой из трёх форм: конверт {code, data}, объект
     {data: {...}} без code или плоский объект. Форма реального ответа подтверждена частично
@@ -326,12 +310,6 @@ def describe_shape(payload: object, depth: int = 2) -> str:
     return type(payload).__name__
 
 
-# Эмпирический эталон: так выглядит ответ для ключа с одним правом «чтение» (одно наблюдение,
-# 2026-11-13, права подтверждены вручную в API Management). Значения кодов в документации не
-# сверялись, поэтому любое другое значение — повод проверить права вручную, а не вывод о рисках.
-READ_ONLY_PERMISSIONS_REFERENCE = [1]
-
-
 def permission_fields(data: object) -> dict[str, object]:
     """Поля ответа о правах, безопасные для показа: булевы и целые значения, списки целых
     (так выглядит `permissions`), для остальных списков только длина. Строки (в них бывает
@@ -346,21 +324,6 @@ def permission_fields(data: object) -> dict[str, object]:
             ints = all(isinstance(x, int) and not isinstance(x, bool) for x in value)
             result[str(name)] = value if ints else f"list[{len(value)}]"
     return result
-
-
-def permissions_differ_from_reference(data: object) -> str | None:
-    """Сообщение, если список `permissions` отличается от эталона ключа только на чтение."""
-    if not isinstance(data, dict):
-        return None
-    perms = data.get("permissions")
-    if not isinstance(perms, list) or not all(isinstance(x, int) for x in perms):
-        return None
-    if sorted(set(perms)) == READ_ONLY_PERMISSIONS_REFERENCE:
-        return None
-    return (
-        f"permissions={perms}, у ключа только на чтение было {READ_ONLY_PERMISSIONS_REFERENCE}: "
-        "проверь права ключа вручную в API Management"
-    )
 
 
 class BingXReadOnlyClient:

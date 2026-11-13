@@ -25,8 +25,6 @@ from squeezelab.data.bingx_rest import (
     describe_shape,
     extract_permissions,
     permission_fields,
-    permissions_differ_from_reference,
-    risky_permissions,
     summarize_balance,
 )
 from squeezelab.data.bingx_signing import API_KEY_HEADER, build_signed_query, sign
@@ -240,45 +238,17 @@ def test_summarize_balance_rejects_unknown_shapes(bad: object) -> None:
         summarize_balance(bad)
 
 
-def test_permission_helpers() -> None:
-    data = {
-        "ipRestrict": True,
-        "permitsEnableWithdraw": False,
-        "permitsEnableSpotAndMarginTrade": True,
-        "permitsEnableFutures": True,
-        "permitsEnableReading": True,
-        "apiKey": KEY,
-    }
-    assert risky_permissions(data) == ["permitsEnableSpotAndMarginTrade"]
-    assert "apiKey" not in permission_fields(data)
-    assert permission_fields(data)["ipRestrict"] is True
-    assert risky_permissions({"permitsEnableWithdraw": True}) == ["permitsEnableWithdraw"]
-    assert risky_permissions("text") == []
-    assert permission_fields(None) == {}
-
-
-# Реальная форма ответа apiPermissions на VST (проверено запросом 2026-11-13)
-REAL_PERMISSIONS = {"permissions": [1], "ipAddresses": [], "note": "my note", "apiKey": KEY}
+# Реальный ответ apiPermissions на VST (проверено запросом 2026-11-13): значение permissions=[2];
+# что означает код 2, не подтверждено, поэтому код выводов о правах не делает.
+REAL_PERMISSIONS = {"permissions": [2], "ipAddresses": [], "note": "my note", "apiKey": KEY}
 
 
 def test_permission_fields_real_shape() -> None:
     fields = permission_fields(REAL_PERMISSIONS)
-    assert fields == {"permissions": [1], "ipAddresses": []}
+    assert fields == {"permissions": [2], "ipAddresses": []}
     assert "note" not in fields
     assert "apiKey" not in fields
     assert permission_fields({"ipAddresses": ["1.2.3.4", "5.6.7.8"]}) == {"ipAddresses": "list[2]"}
-
-
-def test_reference_comparison() -> None:
-    assert permissions_differ_from_reference(REAL_PERMISSIONS) is None
-    assert permissions_differ_from_reference({"permissions": [1, 1]}) is None
-    message = permissions_differ_from_reference({"permissions": [1, 3]})
-    assert message is not None
-    assert "[1, 3]" in message
-    assert "вручную" in message
-    assert permissions_differ_from_reference({"permissions": []}) is not None
-    assert permissions_differ_from_reference({"other": 1}) is None
-    assert permissions_differ_from_reference("text") is None
 
 
 # ---------------------------------------------------------------- команда CLI
@@ -358,20 +328,6 @@ def test_cli_live_hides_amounts_and_uses_live_host(
         ]
     )
     assert "availableMargin=0" in capsys.readouterr().out
-
-
-def test_cli_warns_about_risky_permissions(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    env = _env(tmp_path, monkeypatch)
-    _patch_transport(
-        monkeypatch, _router({"permitsEnableFutures": True, "permitsEnableWithdraw": True})
-    )
-    code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
-    err = capsys.readouterr().err
-    assert code == 0
-    assert "ВНИМАНИЕ" in err
-    assert "permitsEnableWithdraw" in err
 
 
 def test_cli_permissions_endpoint_failure_is_not_fatal(
@@ -474,7 +430,19 @@ def _router_raw(permissions_payload: object) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-def test_cli_real_permissions_shape_reports_ip_and_no_warning(
+def test_permission_fields_hides_strings_and_flags_shape_still_printed() -> None:
+    data = {
+        "permitsEnableReading": True,
+        "permitsEnableWithdraw": False,
+        "apiKey": KEY,
+        "note": "x",
+    }
+    assert permission_fields(data) == {"permitsEnableReading": True, "permitsEnableWithdraw": False}
+    assert permission_fields("text") == {}
+    assert permission_fields(None) == {}
+
+
+def test_cli_prints_permission_values_and_reminder_without_conclusions(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = _env(tmp_path, monkeypatch)
@@ -482,23 +450,36 @@ def test_cli_real_permissions_shape_reports_ip_and_no_warning(
     code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
     captured = capsys.readouterr()
     assert code == 0
-    assert "{'permissions': [1], 'ipAddresses': []}" in captured.out
-    assert "Привязка к IP (ipAddresses): нет адресов" in captured.out
+    assert "{'permissions': [2], 'ipAddresses': []}" in captured.out
+    assert "ipAddresses: в списке 0 адресов" in captured.out
+    assert "Проверь права вручную в API Management" in captured.out
+    assert "не сверены с документацией" in captured.out
     assert "ВНИМАНИЕ" not in captured.err
+    assert "только на чтение" not in captured.out
     assert "my note" not in captured.out
     assert KEY not in captured.out + captured.err
 
 
-def test_cli_warns_when_permissions_differ_from_reference(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"permissions": [1, 3], "ipAddresses": ["203.0.113.7"]},
+        {"permissions": [], "ipAddresses": []},
+        {"permitsEnableFutures": True, "permitsEnableWithdraw": True},
+    ],
+)
+def test_cli_never_judges_permissions(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
 ) -> None:
     env = _env(tmp_path, monkeypatch)
-    payload = {"permissions": [1, 3], "ipAddresses": ["203.0.113.7"]}
     _patch_transport(monkeypatch, _router_raw(payload))
     code = main(["bingx-auth-check", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
     captured = capsys.readouterr()
     assert code == 0
-    assert "ВНИМАНИЕ" in captured.err
-    assert "[1, 3]" in captured.err
-    assert "Привязка к IP (ipAddresses): есть" in captured.out
-    assert "203.0.113.7" not in captured.out + captured.err
+    assert "ВНИМАНИЕ" not in captured.err
+    assert captured.err == ""
+    assert "Проверь права вручную" in captured.out
+    assert "203.0.113.7" not in captured.out

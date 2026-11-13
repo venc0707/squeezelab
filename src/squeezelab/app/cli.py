@@ -30,8 +30,6 @@ from squeezelab.data.bingx_rest import (
     describe_shape,
     extract_permissions,
     permission_fields,
-    permissions_differ_from_reference,
-    risky_permissions,
 )
 from squeezelab.data.models import (
     detect_order,
@@ -317,20 +315,13 @@ def cmd_bingx_auth_check(args: argparse.Namespace) -> int:
             print(f"Права ключа (поля из ответа): {fields or 'полей не найдено'}")
             if "ipAddresses" in fields:
                 ips = fields["ipAddresses"]
-                bound = ips != [] and ips != "list[0]"
-                print(f"Привязка к IP (ipAddresses): {'есть' if bound else 'нет адресов'}")
+                count = len(ips) if isinstance(ips, list) else ips
+                print(f"ipAddresses: в списке {count} адресов")
             print(f"Форма ответа (только имена и типы): {describe_shape(payload)}")
-            warnings = []
-            risky = risky_permissions(permissions)
-            if risky:
-                warnings.append(
-                    "включены права, похожие на торговлю, перевод или вывод: " + ", ".join(risky)
-                )
-            differs = permissions_differ_from_reference(permissions)
-            if differs:
-                warnings.append(differs)
-            for warning in warnings:
-                print(f"ВНИМАНИЕ: {warning}", file=sys.stderr)
+            print(
+                "Примечание: значения кодов permissions не сверены с документацией, команда "
+                "выводов о правах ключа не делает. Проверь права вручную в API Management."
+            )
     return EXIT_OK
 
 
