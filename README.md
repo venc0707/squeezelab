@@ -11,7 +11,7 @@ Williams %R (период 500), таймфрейм 15 минут. Это инж�
 Нужны Python 3.11+ и [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <адрес репозитория> squeezelab
+git clone https://github.com/venc0707/squeezelab.git squeezelab
 cd squeezelab
 uv sync                          # создаёт .venv и ставит зависимости вместе с dev-группой
 uv run pre-commit install        # хуки перед каждым коммитом
