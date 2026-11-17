@@ -1,7 +1,8 @@
-# Runbook (заготовка, Phase 00)
+# Runbook (Phase 00–01)
 
 Дополняется по мере появления сервисов. Сейчас бот ничего не торгует: есть конфиги, проверки и
-три диагностические команды.
+диагностические команды. Разработка идёт на Windows-ПК, сервер (Ubuntu Server) предназначен для
+рекордеров (Phase 01); обе среды описаны ниже.
 
 ## Запуск проверок
 
@@ -24,7 +25,8 @@ uv run pre-commit run --all-files
 |---|---|
 | Секреты | `.env` в корне репозитория (вне git); шаблон — `.env.example` |
 | Конфиги | `config/*.yaml` (app, presets, exits, risk, symbols); каталог можно сменить `--config-dir` или `SQUEEZELAB_CONFIG_DIR` |
-| Данные, логи | `data/`, `logs/` (вне git; пути в `config/app.yaml`) |
+| Данные | Каталог из переменной `SQUEEZELAB_DATA_DIR`, иначе `paths.data_dir` в `config/app.yaml`, иначе `./data` (вне git). На сервере: `/srv/data/squeezelab` |
+| Логи | `logs/` (вне git; `paths.logs_dir` в `config/app.yaml`) |
 | Решения и открытые вопросы | `docs/decisions.md` |
 | Факты об API BingX и их статус проверки | `docs/bingx_api_notes.md` |
 
@@ -32,10 +34,10 @@ uv run pre-commit run --all-files
 
 | Команда | Что делает | Сеть |
 |---|---|---|
-| `uv run squeezelab config check` | Проверяет конфиги, печатает режим, хэш (sha256), открытые решения (null) и какие секреты заданы (без значений) | нет |
-| `uv run squeezelab notify-test [--dry-run]` | Отправляет тестовое сообщение (режим, хэш конфига, время UTC) в чаты из белого списка; `--dry-run` только показывает текст | Telegram |
+| `uv run squeezelab config check` | Проверяет конфиги, печатает режим, два хэша (`strategy_hash` и `app_hash`, sha256), каталог данных и его источник, пары рекордера, открытые решения (null) и какие секреты заданы (без значений) | нет |
+| `uv run squeezelab notify-test [--dry-run]` | Отправляет тестовое сообщение (режим, оба хэша, время UTC) в чаты из белого списка; `--dry-run` только показывает текст и сообщает, задан ли прокси. Читает только секреты Telegram | Telegram (через `TELEGRAM_PROXY_URL`, если задан) |
 | `uv run squeezelab bingx-smoke [--limit N] [--save-raw ФАЙЛ]` | Публичный запрос свечей BNB-USDT 15m: количество, первая и последняя метка, порядок, признак незакрытой свечи, заголовки лимитов | BingX, без ключей |
-| `uv run squeezelab bingx-auth-check [--show-balance]` | Один подписанный запрос на чтение (баланс) в окружении `BINGX_ENV`, затем справочная проверка прав ключа | BingX, ключ |
+| `uv run squeezelab bingx-auth-check [--show-balance]` | Один подписанный запрос на чтение (баланс) в окружении `BINGX_ENV`, затем справочная проверка прав ключа. Читает только секреты BingX | BingX, ключ |
 
 Коды выхода: 0 — успех, 1 — сбой операции (сеть, API), 2 — ошибка конфига или аргументов.
 
@@ -93,6 +95,49 @@ uv run pre-commit run --all-files
 7. BingX блокирует доступ по региону («Доступ закрыт»), в том числе с части VPN. Запросы к
    BingX запускай без VPN.
 
+## Linux (сервер) и ПК: одинаковая проверка
+
+Код работает на обеих платформах без правок. Сервер: Ubuntu Server, данные на отдельном диске
+`/srv/data`, перезагрузки вручную.
+
+```bash
+# сервер, один раз
+git clone <адрес репозитория> squeezelab && cd squeezelab
+uv sync
+cp .env.example .env              # заполнить только нужное; права: chmod 600 .env
+
+# каждая сессия (в юните systemd переменная задаётся через Environment=)
+export SQUEEZELAB_DATA_DIR=/srv/data/squeezelab
+uv run squeezelab config check
+```
+
+Сверка среды: в выводе `config check` на ПК и на сервере должны совпасть обе строки с хэшами
+(`strategy_hash` и `app_hash`). Они не зависят от ОС и от `SQUEEZELAB_DATA_DIR`. Строка
+«Каталог данных» на сервере покажет `/srv/data/squeezelab (источник: переменная
+SQUEEZELAB_DATA_DIR)`, на ПК обычно `data (источник: paths.data_dir в app.yaml)`: это нормально,
+различие в путях хэши не меняет. Хэши расходятся, если на машинах разные версии файлов
+`config/*.yaml`: сравни `git rev-parse --short HEAD`.
+
+`SQUEEZELAB_DATA_DIR` читается только из окружения процесса, не из `.env`. Каталог команда сама не
+создаёт: его создаёт хранилище при первой записи (P01-T02).
+
+## Прокси (Telegram) и прямое соединение (BingX)
+
+- **BingX всегда напрямую.** Клиенты BingX игнорируют `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` и
+  `NO_PROXY`. BingX блокирует часть регионов и VPN, поэтому запросы к нему не должны идти через
+  прокси или VPN.
+- **Telegram через явный прокси.** Если `api.telegram.org` недоступен напрямую (сервер), задай в
+  `.env` адрес локального прокси, например Xray с HTTP-входом:
+  ```
+  TELEGRAM_PROXY_URL=http://127.0.0.1:10809
+  ```
+  Допустимы схемы `http` и `https`; `socks5` не поддерживается. Адрес считается секретом (в нём
+  бывают логин и пароль): он не печатается и маскируется в логах. Пустое значение = без прокси.
+- Проверка: `uv run squeezelab notify-test --dry-run` печатает «Прокси Telegram: задан» или
+  «не задан», затем `uv run squeezelab notify-test` отправляет сообщение.
+- Клиенты проекта не читают также `SSL_CERT_FILE`, `SSL_CERT_DIR` и `~/.netrc`
+  (`trust_env=False`, см. `docs/decisions.md`, B-13).
+
 ## Безопасность
 
 - `.env` не коммитится (`.gitignore`, хук `detect-private-key`). Если секрет попал в git или чат,
@@ -105,8 +150,11 @@ uv run pre-commit run --all-files
 | Симптом | Что делать |
 |---|---|
 | `config check`: ОШИБКА с путём `lvl6.level` и т. п. | Исправить значение в `config/*.yaml` по тексту ошибки |
-| `режим ... запрещён, пока открыты решения (null)` | Режимы кроме `signals_only` включаются только после закрытия решений в `risk.yaml` и `exits.yaml` |
-| `notify-test`: таймаут или сетевая ошибка | Проверить сеть; `api.telegram.org` может быть недоступен без VPN |
+| `режим ... запрещён, пока открыты решения (null)` | Режимы кроме `signals_only` включаются только после закрытия решений в `risk.yaml` и `exits.yaml`; для `paper_vst` и `live` нужны ещё `presets.*.priority` |
+| `notify-test`: таймаут или сетевая ошибка | Проверить сеть; `api.telegram.org` может быть недоступен напрямую: на сервере задай `TELEGRAM_PROXY_URL` и проверь, что прокси слушает порт (`ss -ltn \| grep 10809`) |
+| `config check`: `TELEGRAM_PROXY_URL: ожидается адрес вида http://...` | Нужна схема `http://` или `https://`, хост и числовой порт; `socks5://` не поддерживается |
+| На сервере данные ложатся не туда | Запусти `config check` и посмотри строку «Каталог данных»: если там `data`, переменная `SQUEEZELAB_DATA_DIR` не передана процессу (в systemd нужен `Environment=`) |
+| `config check` на ПК и сервере печатает разные хэши | Сравни версии файлов `config/*.yaml` (`git rev-parse --short HEAD`); путь данных и `.env` на хэши не влияют |
 | `notify-test`: 400 chat not found | Неверный chat_id или бот не добавлен в чат |
 | BingX: «Доступ закрыт», 403 или HTML вместо JSON | Блокировка по региону или VPN: отключить VPN. Для будущего сервера проверить, что регион размещения BingX допускает |
 | `bingx-auth-check`: отказ подписи | Проверить ключ и секрет, `BINGX_ENV`, привязку по IP и синхронизацию времени (окно 5000 мс) |

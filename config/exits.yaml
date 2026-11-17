@@ -1,7 +1,7 @@
-# Лесенка тейков и перенос стопа. Тип тейков и буфер БУ — открытые решения (null).
+# Лесенка тейков и перенос стопа. Тип тейков и буфер БУ (в б.п.) — открытые решения (null).
 ladder:
   r_multiples: [1, 2, 3, 5, 10]
   shares_pct: [25, 25, 25, 15, 10]
 breakeven_after: TP1
-breakeven_buffer: null   # единица измерения и значение — открыты
+breakeven_buffer_bps: null   # запас БУ в б.п. (1 б.п. = 0,01 %) от цены входа; значение открыто
 tp_order_type: null      # limit | take_profit_market

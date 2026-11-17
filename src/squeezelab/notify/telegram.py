@@ -16,6 +16,7 @@ from typing import Any, Self
 import httpx
 from pydantic import SecretStr
 
+from squeezelab.app.http_clients import build_telegram_http_client
 from squeezelab.app.logging_setup import redact
 
 TELEGRAM_API_URL = "https://api.telegram.org"
@@ -30,12 +31,15 @@ class ChatNotAllowedError(TelegramError):
     """chat_id не входит в белый список; запрос в сеть не отправлялся."""
 
 
-def build_test_message(mode: str, config_hash: str, now: datetime | None = None) -> str:
+def build_test_message(
+    mode: str, strategy_hash: str, app_hash: str, now: datetime | None = None
+) -> str:
     moment = (now or datetime.now(UTC)).astimezone(UTC)
     return (
         "SqueezeLab: тестовое сообщение\n"
         f"Режим: {mode}\n"
-        f"Хэш конфига: {config_hash}\n"
+        f"Хэш стратегии: {strategy_hash}\n"
+        f"Хэш приложения: {app_hash}\n"
         f"Время: {moment:%Y-%m-%d %H:%M:%S} UTC"
     )
 
@@ -49,11 +53,17 @@ class TelegramClient:
         base_url: str = TELEGRAM_API_URL,
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
+        proxy: SecretStr | None = None,
     ) -> None:
         self._token = token
         self._allowed = frozenset(allowed_chat_ids)
         self._base_url = base_url.rstrip("/")
-        self._http = httpx.Client(timeout=timeout, transport=transport)
+        # Прокси только явный (из TELEGRAM_PROXY_URL); HTTP(S)_PROXY процесса не используются.
+        self._http = build_telegram_http_client(
+            timeout=timeout,
+            transport=transport,
+            proxy=proxy.get_secret_value() if proxy is not None else None,
+        )
 
     def __enter__(self) -> Self:
         return self

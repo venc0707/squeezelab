@@ -1,4 +1,4 @@
-"""Тесты P00-T03: клиент Telegram на mock-транспорте (сеть не используется)."""
+"""Тесты P00-T03 и P01-T01: клиент Telegram на mock-транспорте (внешняя сеть не используется)."""
 
 from __future__ import annotations
 
@@ -162,21 +162,32 @@ def test_error_text_survives_redacting_log_formatter() -> None:
 
 def test_build_test_message() -> None:
     now = datetime(2026, 11, 10, 12, 30, 5, tzinfo=UTC)
-    text = build_test_message("signals_only", "a" * 64, now)
+    text = build_test_message("signals_only", "a" * 64, "b" * 64, now)
     assert "Режим: signals_only" in text
-    assert "Хэш конфига: " + "a" * 64 in text
+    assert "Хэш стратегии: " + "a" * 64 in text
+    assert "Хэш приложения: " + "b" * 64 in text
     assert "2026-11-10 12:30:05 UTC" in text
 
 
 # ------------------------------------------------------------------ команда notify-test
 
 
-def _env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, token: bool = True) -> Path:
-    for name in ("BINGX_API_KEY", "BINGX_API_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_IDS"):
+def _env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, token: bool = True, proxy: str = ""
+) -> Path:
+    for name in (
+        "BINGX_API_KEY",
+        "BINGX_API_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_IDS",
+        "TELEGRAM_PROXY_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
     env = tmp_path / ".env"
     lines = [f"TELEGRAM_BOT_TOKEN={TOKEN}"] if token else []
     lines.append(f"TELEGRAM_CHAT_IDS={CHAT}")
+    if proxy:
+        lines.append(f"TELEGRAM_PROXY_URL={proxy}")
     env.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return env
 
@@ -198,7 +209,42 @@ def test_cli_dry_run_sends_nothing(
     assert "Сухой прогон" in out
     assert "Режим: signals_only" in out
     assert str(CHAT) in out
+    assert "Прокси Telegram: не задан" in out
     assert TOKEN not in out
+
+
+def test_cli_dry_run_reports_proxy_without_showing_it(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch, proxy="http://user:pa55word@127.0.0.1:10809")
+    code = main(
+        ["notify-test", "--dry-run", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Прокси Telegram: задан" in out
+    assert "pa55word" not in out
+    assert "127.0.0.1:10809" not in out
+
+
+def test_cli_passes_proxy_from_env_to_client(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch, proxy="http://127.0.0.1:10809")
+    seen: list[str | None] = []
+    original_init = TelegramClient.__init__
+
+    def spy_init(self: TelegramClient, *args: object, **kwargs: object) -> None:
+        proxy = kwargs.get("proxy")
+        seen.append(proxy.get_secret_value() if isinstance(proxy, SecretStr) else None)
+        original_init(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(TelegramClient, "__init__", spy_init)
+    monkeypatch.setattr(TelegramClient, "send_message", lambda *_a, **_k: None)
+    code = main(["notify-test", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
+    assert code == 0
+    assert seen == ["http://127.0.0.1:10809"]
+    assert "pa55word" not in capsys.readouterr().out
 
 
 def test_cli_without_telegram_settings(
@@ -223,7 +269,8 @@ def test_cli_real_send_uses_whitelist_and_reports(
     code = main(["notify-test", "--config-dir", str(REPO_CONFIG), "--env-file", str(env)])
     assert code == 0
     assert [cid for cid, _ in sent] == [CHAT]
-    assert "Хэш конфига:" in sent[0][1]
+    assert "Хэш стратегии:" in sent[0][1]
+    assert "Хэш приложения:" in sent[0][1]
     assert f"chat_id {CHAT}: отправлено" in capsys.readouterr().out
 
 

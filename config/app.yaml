@@ -1,8 +1,18 @@
 # Режим работы: signals_only | backtest | paper_vst | live.
-# Всё, кроме signals_only, запрещено, пока в risk.yaml и exits.yaml есть null.
+# Всё, кроме signals_only, запрещено, пока в risk.yaml и exits.yaml есть null
+# (для paper_vst и live ещё и presets.*.priority).
 mode: signals_only
 timezone: UTC
 paths:
+  # Каталог данных. Переменная окружения SQUEEZELAB_DATA_DIR приоритетнее этого значения
+  # (на сервере: /srv/data/squeezelab). Не задан совсем = ./data. Относительный путь
+  # считается от текущего каталога процесса.
   data_dir: data
   logs_dir: logs
 log_level: INFO
+# Рекордер (Phase 01). Лежит здесь, а не в symbols.yaml: смена этих значений не должна менять
+# strategy_hash (в него входят presets, exits, risk, symbols).
+recorder:
+  symbols: [BNB-USDT]
+  oi_interval_s: 60       # опрос открытого интереса, секунд (10..3600)
+  funding_interval_s: 60  # опрос текущей и следующей ставки funding, секунд (10..3600)

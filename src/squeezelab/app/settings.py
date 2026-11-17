@@ -5,8 +5,10 @@
 - Открытые решения хранятся как `null` и не додумываются. Пока они не закрыты,
   режим работы может быть только `signals_only`.
 - Секреты читаются только из окружения (`.env` вне git) и маскируются в repr.
-- Хэш конфига считается от проверенных моделей, а не от текста YAML: комментарии,
-  порядок ключей и `6` против `6.0` на хэш не влияют.
+- Хэш считается от проверенных моделей, а не от текста YAML: комментарии, порядок ключей и
+  `6` против `6.0` на хэш не влияют. Хэш делится на две части: `strategy_hash` (presets,
+  exits, risk, symbols; идёт в журнал и сигналы) и `app_hash` (app.yaml; только диагностика).
+- Секреты читаются по областям: рекордеру не нужны ключи BingX, команде BingX не нужен Telegram.
 """
 
 from __future__ import annotations
@@ -14,10 +16,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
@@ -43,8 +49,19 @@ CONFIG_FILES: dict[str, str] = {
     "symbols": "symbols.yaml",
 }
 
+DATA_DIR_ENV = "SQUEEZELAB_DATA_DIR"
+DEFAULT_DATA_DIR = "data"
+
 _TF_PATTERN = r"^[1-9][0-9]*[mhdw]$"
+_SYMBOL_PATTERN = r"^[A-Z0-9]+-[A-Z0-9]+$"
 _SUM_EPS = 1e-9
+
+# Хэш делится на две части. Состав strategy_hash — решение мастера (Phase 01).
+STRATEGY_SECTIONS = ("presets", "exits", "risk", "symbols")
+
+# Режимы, которым нужен приоритет пресетов (D-01). Бэктест приоритет не требует: матрица
+# пересечения пресетов считается в Phase 4 как раз для того, чтобы его выбрать.
+_MODES_NEEDING_PRIORITY = frozenset({"paper_vst", "live"})
 
 
 class ConfigError(Exception):
@@ -70,9 +87,31 @@ class _Strict(BaseModel):
 
 
 class PathsConfig(_Strict):
-    # Строки, а не Path: хэш конфига не должен зависеть от ОС (разделители путей).
-    data_dir: str = Field(min_length=1)
+    # Строки, а не Path: хэш не должен зависеть от ОС (разделители путей).
+    # data_dir: не задан = ./data. Переменная SQUEEZELAB_DATA_DIR приоритетнее (resolve_data_dir).
+    data_dir: str | None = Field(default=None, min_length=1)
     logs_dir: str = Field(min_length=1)
+
+
+class RecorderConfig(_Strict):
+    """Настройки рекордера. Живут в app.yaml, а не в symbols.yaml: смена списка пар рекордера
+    не должна менять strategy_hash."""
+
+    symbols: list[str] = Field(default_factory=lambda: ["BNB-USDT"], min_length=1)
+    # Нижняя граница 10 с — защита от случайного шквала запросов (лимит биржи 500 за 10 с).
+    oi_interval_s: int = Field(default=60, ge=10, le=3600)
+    funding_interval_s: int = Field(default=60, ge=10, le=3600)
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols_ok(cls, value: list[str]) -> list[str]:
+        pattern = re.compile(_SYMBOL_PATTERN)
+        for symbol in value:
+            if not pattern.match(symbol):
+                raise ValueError(f"символ {symbol!r}: ожидается вид BNB-USDT")
+        if len(set(value)) != len(value):
+            raise ValueError("символ указан дважды")
+        return value
 
 
 class AppConfig(_Strict):
@@ -80,6 +119,7 @@ class AppConfig(_Strict):
     timezone: Literal["UTC"] = "UTC"
     paths: PathsConfig
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    recorder: RecorderConfig = Field(default_factory=RecorderConfig)
 
 
 # ----------------------------------------------------------------------- presets.yaml
@@ -170,7 +210,8 @@ class LadderConfig(_Strict):
 class ExitsConfig(_Strict):
     ladder: LadderConfig
     breakeven_after: str = Field(pattern=r"^TP[1-5]$")
-    breakeven_buffer: float | None = Field(default=None, ge=0)  # единица измерения — открыта
+    # Запас БУ в б.п. (1 б.п. = 0,01 %) от цены входа; значение — открытое решение (null).
+    breakeven_buffer_bps: float | None = Field(default=None, ge=0)
     tp_order_type: Literal["limit", "take_profit_market"] | None = None
 
     @model_validator(mode="after")
@@ -218,7 +259,7 @@ class RiskConfig(_Strict):
 
 
 class SymbolConfig(_Strict):
-    symbol: str = Field(pattern=r"^[A-Z0-9]+-[A-Z0-9]+$")
+    symbol: str = Field(pattern=_SYMBOL_PATTERN)
     tf: str = Field(pattern=_TF_PATTERN)
     data_start: date
     warmup_bars: int = Field(ge=0)
@@ -254,6 +295,8 @@ class ProjectConfig(_Strict):
             return self
         missing = [f"risk.{n}" for n in self.risk.unresolved()]
         missing += [f"exits.{n}" for n in self.exits.unresolved()]
+        if self.app.mode.value in _MODES_NEEDING_PRIORITY:
+            missing += self._null_priorities()
         if missing:
             raise ValueError(
                 f"режим {self.app.mode.value} запрещён, пока открыты решения (null): "
@@ -272,15 +315,18 @@ class ProjectConfig(_Strict):
                     )
         return self
 
-    def unresolved_decisions(self) -> list[str]:
-        """Все открытые (null) решения для сводки в `config check`."""
-        items = [f"risk.{n}" for n in self.risk.unresolved()]
-        items += [f"exits.{n}" for n in self.exits.unresolved()]
-        items += [
+    def _null_priorities(self) -> list[str]:
+        return [
             f"presets.{name}.priority"
             for name, preset in self.presets.presets.items()
             if preset.priority is None
         ]
+
+    def unresolved_decisions(self) -> list[str]:
+        """Все открытые (null) решения для сводки в `config check`."""
+        items = [f"risk.{n}" for n in self.risk.unresolved()]
+        items += [f"exits.{n}" for n in self.exits.unresolved()]
+        items += self._null_priorities()
         return items
 
 
@@ -343,45 +389,84 @@ def load_project_config(config_dir: Path | str | None = None) -> ProjectConfig:
         ) from exc
 
 
-def canonical_config_json(config: ProjectConfig) -> str:
+def _canonical_json(data: object) -> str:
     """Канонический JSON: ключи отсортированы, без пробелов, UTF-8."""
     return json.dumps(
-        config.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
+        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     )
 
 
-def config_hash(config: ProjectConfig) -> str:
-    """sha256 от канонического JSON всех проверенных конфигов."""
-    return hashlib.sha256(canonical_config_json(config).encode("utf-8")).hexdigest()
+def canonical_strategy_json(config: ProjectConfig) -> str:
+    return _canonical_json(config.model_dump(mode="json", include=set(STRATEGY_SECTIONS)))
+
+
+def canonical_app_json(config: ProjectConfig) -> str:
+    return _canonical_json(config.app.model_dump(mode="json"))
+
+
+def strategy_hash(config: ProjectConfig) -> str:
+    """sha256 от presets, exits, risk и symbols. Идёт в журнал и в каждый сигнал."""
+    return hashlib.sha256(canonical_strategy_json(config).encode("utf-8")).hexdigest()
+
+
+def app_hash(config: ProjectConfig) -> str:
+    """sha256 от app.yaml (режим, пути, рекордер, логи). Только для диагностики."""
+    return hashlib.sha256(canonical_app_json(config).encode("utf-8")).hexdigest()
+
+
+# ------------------------------------------------------------------------- путь данных
+
+DataDirSource = Literal["env", "app.yaml", "default"]
+
+
+@dataclass(frozen=True, slots=True)
+class DataDir:
+    path: Path
+    source: DataDirSource
+
+
+def resolve_data_dir(app: AppConfig, environ: Mapping[str, str] | None = None) -> DataDir:
+    """Каталог данных: переменная SQUEEZELAB_DATA_DIR → `paths.data_dir` в app.yaml → ./data.
+
+    Относительный путь считается от текущего каталога процесса. Пустая переменная окружения
+    считается незаданной. Каталог не создаётся и не проверяется: это дело хранилища.
+    Переменная читается только из окружения процесса (не из .env), как и SQUEEZELAB_CONFIG_DIR.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(DATA_DIR_ENV, "").strip()
+    if raw:
+        return DataDir(Path(raw).expanduser(), "env")
+    if app.paths.data_dir:
+        return DataDir(Path(app.paths.data_dir).expanduser(), "app.yaml")
+    return DataDir(Path(DEFAULT_DATA_DIR), "default")
 
 
 # --------------------------------------------------------------------------- секреты
 
 
-class Secrets(BaseSettings):
-    """Секреты из окружения и файла .env (переменные окружения приоритетнее файла).
+_SECRETS_CONFIG = SettingsConfigDict(
+    env_file=".env",
+    env_file_encoding="utf-8",
+    extra="ignore",
+    case_sensitive=False,
+)
+
+
+class TelegramSecrets(BaseSettings):
+    """Секреты Telegram (все необязательны). Этого достаточно рекордеру и notify-test.
 
     Значения хранятся как SecretStr: в repr и str видно только «**********».
     """
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
+    model_config = _SECRETS_CONFIG
 
-    bingx_api_key: SecretStr | None = None
-    bingx_api_secret: SecretStr | None = None
-    bingx_env: Literal["vst", "live"] = "vst"
     telegram_bot_token: SecretStr | None = None
     telegram_chat_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    # Прокси только для Telegram (BingX всегда идёт напрямую). Адрес может содержать логин и
+    # пароль, поэтому это секрет.
+    telegram_proxy_url: SecretStr | None = None
 
-    @field_validator("bingx_api_key", "bingx_api_secret", "telegram_bot_token", mode="before")
+    @field_validator("telegram_bot_token", "telegram_proxy_url", mode="before")
     @classmethod
     def _blank_is_none(cls, value: object) -> object:
         # Пустая строка из шаблона .env.example означает «не задано».
@@ -390,10 +475,20 @@ class Secrets(BaseSettings):
             return value or None
         return value
 
-    @field_validator("bingx_env", mode="before")
+    @field_validator("telegram_proxy_url")
     @classmethod
-    def _env_lower(cls, value: object) -> object:
-        return value.strip().lower() if isinstance(value, str) else value
+    def _proxy_url_shape(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        # Тексты ошибок не содержат значения: в адресе бывает пароль.
+        try:
+            parts = urlsplit(value.get_secret_value())
+            _ = parts.port  # неверный порт даёт ValueError
+        except ValueError:
+            raise ValueError("не удалось разобрать адрес прокси") from None
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("ожидается адрес вида http://127.0.0.1:10809 (схемы http и https)")
+        return value
 
     @field_validator("telegram_chat_ids", mode="before")
     @classmethod
@@ -417,32 +512,76 @@ class Secrets(BaseSettings):
         return value
 
     @property
-    def has_bingx_credentials(self) -> bool:
-        return self.bingx_api_key is not None and self.bingx_api_secret is not None
-
-    @property
     def has_telegram(self) -> bool:
         return self.telegram_bot_token is not None and bool(self.telegram_chat_ids)
 
     def secret_values(self) -> list[str]:
         """Открытые значения секретов — только для маскирования в логах."""
-        raw = [self.bingx_api_key, self.bingx_api_secret, self.telegram_bot_token]
+        raw = [self.telegram_bot_token, self.telegram_proxy_url]
         return [s.get_secret_value() for s in raw if s is not None and s.get_secret_value()]
 
     def presence(self) -> dict[str, bool]:
         """Что задано (без значений) — для `config check`."""
         return {
-            "BINGX_API_KEY": self.bingx_api_key is not None,
-            "BINGX_API_SECRET": self.bingx_api_secret is not None,
             "TELEGRAM_BOT_TOKEN": self.telegram_bot_token is not None,
             "TELEGRAM_CHAT_IDS": bool(self.telegram_chat_ids),
+            "TELEGRAM_PROXY_URL": self.telegram_proxy_url is not None,
         }
 
 
-def load_secrets(env_file: Path | str | None = ".env") -> Secrets:
-    """Читает секреты. Отсутствующий файл .env — не ошибка (могут быть переменные окружения)."""
+class BingXSecrets(BaseSettings):
+    """Секреты BingX. Нужны только командам, которые ходят в приватный API."""
+
+    model_config = _SECRETS_CONFIG
+
+    bingx_api_key: SecretStr | None = None
+    bingx_api_secret: SecretStr | None = None
+    bingx_env: Literal["vst", "live"] = "vst"
+
+    @field_validator("bingx_api_key", "bingx_api_secret", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("bingx_env", mode="before")
+    @classmethod
+    def _env_lower(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @property
+    def has_bingx_credentials(self) -> bool:
+        return self.bingx_api_key is not None and self.bingx_api_secret is not None
+
+    def secret_values(self) -> list[str]:
+        raw = [self.bingx_api_key, self.bingx_api_secret]
+        return [s.get_secret_value() for s in raw if s is not None and s.get_secret_value()]
+
+    def presence(self) -> dict[str, bool]:
+        return {
+            "BINGX_API_KEY": self.bingx_api_key is not None,
+            "BINGX_API_SECRET": self.bingx_api_secret is not None,
+        }
+
+
+class Secrets(TelegramSecrets, BingXSecrets):
+    """Все секреты проекта сразу. Нужен только `config check`; остальным командам — своя область."""
+
+    def secret_values(self) -> list[str]:
+        return BingXSecrets.secret_values(self) + TelegramSecrets.secret_values(self)
+
+    def presence(self) -> dict[str, bool]:
+        return {**BingXSecrets.presence(self), **TelegramSecrets.presence(self)}
+
+
+_S = TypeVar("_S", bound=BaseSettings)
+
+
+def _load(cls: type[_S], env_file: Path | str | None) -> _S:
     try:
-        return Secrets(_env_file=env_file)
+        return cls(_env_file=env_file)
     except ValidationError as exc:
         # Значения секретов в сообщение не попадают: только имена полей и тексты проверок.
         lines = [f"{env_file}: секреты не прошли проверку"]
@@ -450,3 +589,18 @@ def load_secrets(env_file: Path | str | None = ".env") -> Secrets:
             where = ".".join(str(part) for part in err["loc"]).upper()
             lines.append(f"  - {where}: {str(err['msg']).removeprefix('Value error, ')}")
         raise ConfigError("\n".join(lines)) from None
+
+
+def load_secrets(env_file: Path | str | None = ".env") -> Secrets:
+    """Все секреты. Отсутствующий файл .env — не ошибка (могут быть переменные окружения)."""
+    return _load(Secrets, env_file)
+
+
+def load_telegram_secrets(env_file: Path | str | None = ".env") -> TelegramSecrets:
+    """Только Telegram: ключей BingX в такой объект не попадает даже при их наличии в .env."""
+    return _load(TelegramSecrets, env_file)
+
+
+def load_bingx_secrets(env_file: Path | str | None = ".env") -> BingXSecrets:
+    """Только BingX."""
+    return _load(BingXSecrets, env_file)

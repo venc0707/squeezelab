@@ -14,12 +14,17 @@ from pathlib import Path
 from squeezelab import __version__
 from squeezelab.app.logging_setup import configure_logging
 from squeezelab.app.settings import (
+    DATA_DIR_ENV,
     ConfigError,
     ProjectConfig,
-    config_hash,
+    app_hash,
+    load_bingx_secrets,
     load_project_config,
     load_secrets,
+    load_telegram_secrets,
     resolve_config_dir,
+    resolve_data_dir,
+    strategy_hash,
 )
 from squeezelab.data.bingx_rest import (
     LIVE_BASE_URL,
@@ -131,7 +136,16 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     print("Конфиг: OK")
     print(f"Каталог: {resolve_config_dir(args.config_dir)}")
     print(f"Режим: {cfg.app.mode.value}")
-    print(f"Хэш (sha256): {config_hash(cfg)}")
+    print(f"Хэш стратегии (strategy_hash, sha256): {strategy_hash(cfg)}")
+    print(f"Хэш приложения (app_hash, sha256, только диагностика): {app_hash(cfg)}")
+    data_dir = resolve_data_dir(cfg.app)
+    source_names = {
+        "env": f"переменная {DATA_DIR_ENV}",
+        "app.yaml": "paths.data_dir в app.yaml",
+        "default": "по умолчанию ./data",
+    }
+    print(f"Каталог данных: {data_dir.path} (источник: {source_names[data_dir.source]})")
+    print(f"Рекордер: пары {', '.join(cfg.app.recorder.symbols)}")
     print(f"Пресеты: {', '.join(cfg.presets.presets)}")
     print(
         "Пары: " + ", ".join(f"{s.symbol} {s.tf} (с {s.data_start})" for s in cfg.symbols.symbols)
@@ -152,7 +166,7 @@ def cmd_config_check(args: argparse.Namespace) -> int:
 def cmd_notify_test(args: argparse.Namespace) -> int:
     try:
         cfg = _load_config(args.config_dir)
-        secrets = load_secrets(args.env_file)
+        secrets = load_telegram_secrets(args.env_file)
     except ConfigError as exc:
         print(f"Конфиг: ОШИБКА\n{exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -166,15 +180,20 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
         )
         return EXIT_CONFIG
 
-    text = build_test_message(cfg.app.mode.value, config_hash(cfg))
+    text = build_test_message(cfg.app.mode.value, strategy_hash(cfg), app_hash(cfg))
     if args.dry_run:
         print("Сухой прогон, ничего не отправлено. Текст сообщения:\n")
         print(text)
         print(f"\nАдресаты (белый список): {', '.join(map(str, secrets.telegram_chat_ids))}")
+        print(f"Прокси Telegram: {'задан' if secrets.telegram_proxy_url else 'не задан'}")
         return EXIT_OK
 
     failed = False
-    with TelegramClient(secrets.telegram_bot_token, secrets.telegram_chat_ids) as client:
+    with TelegramClient(
+        secrets.telegram_bot_token,
+        secrets.telegram_chat_ids,
+        proxy=secrets.telegram_proxy_url,
+    ) as client:
         for chat_id in secrets.telegram_chat_ids:
             try:
                 client.send_message(chat_id, text)
@@ -269,7 +288,7 @@ _AUTH_HINTS = (
 def cmd_bingx_auth_check(args: argparse.Namespace) -> int:
     try:
         cfg = _load_config(args.config_dir)
-        secrets = load_secrets(args.env_file)
+        secrets = load_bingx_secrets(args.env_file)
     except ConfigError as exc:
         print(f"Конфиг: ОШИБКА\n{exc}", file=sys.stderr)
         return EXIT_CONFIG

@@ -16,7 +16,7 @@ from typing import Any, Self
 import httpx
 from pydantic import SecretStr
 
-from squeezelab import __version__
+from squeezelab.app.http_clients import build_bingx_http_client
 from squeezelab.app.logging_setup import redact
 from squeezelab.data.bingx_signing import API_KEY_HEADER, DEFAULT_RECV_WINDOW_MS, build_signed_query
 from squeezelab.data.models import Candle
@@ -154,12 +154,7 @@ class BingXPublicClient:
         self._max_retries = max_retries
         self._backoff_base = backoff_base
         self._sleep = sleep
-        self._http = httpx.Client(
-            base_url=base_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
-            headers={"User-Agent": f"squeezelab/{__version__}"},
-            transport=transport,
-        )
+        self._http = build_bingx_http_client(base_url, timeout=timeout, transport=transport)
 
     def __enter__(self) -> Self:
         return self
@@ -347,12 +342,7 @@ class BingXReadOnlyClient:
         self._secret = api_secret
         self._recv_window_ms = recv_window_ms
         self._now_ms = now_ms
-        self._http = httpx.Client(
-            base_url=base_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
-            headers={"User-Agent": f"squeezelab/{__version__}"},
-            transport=transport,
-        )
+        self._http = build_bingx_http_client(base_url, timeout=timeout, transport=transport)
 
     def __enter__(self) -> Self:
         return self
