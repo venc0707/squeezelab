@@ -9,6 +9,7 @@ import argparse
 import sys
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from squeezelab import __version__
@@ -42,6 +43,15 @@ from squeezelab.data.models import (
     is_candle_closed,
     is_contiguous,
     tf_to_ms,
+)
+from squeezelab.data.probe import (
+    DEFAULT_ANCHOR,
+    DEFAULT_VOLUME_BAR,
+    build_cases,
+    derive_findings,
+    render_results,
+    run_probe,
+    to_ms,
 )
 from squeezelab.notify.telegram import TelegramClient, TelegramError, build_test_message
 
@@ -105,6 +115,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-raw", type=Path, default=None, help="сохранить сырой JSON-ответ в этот файл"
     )
     smoke.set_defaults(handler=cmd_bingx_smoke)
+
+    probe = sub.add_parser(
+        "bingx-probe-klines",
+        parents=[common],
+        help="пробные публичные запросы свечей: границы startTime/endTime, порядок, усечение",
+    )
+    probe.add_argument("--symbol", default=None, help="по умолчанию первая пара из symbols.yaml")
+    probe.add_argument("--base-url", default=LIVE_BASE_URL, help=f"по умолчанию {LIVE_BASE_URL}")
+    probe.add_argument(
+        "--anchor",
+        default=DEFAULT_ANCHOR.strftime("%Y-%m-%dT%H:%M"),
+        help="граница свечи в прошлом (UTC, ГГГГ-ММ-ДДTЧЧ:ММ), от которой строятся окна",
+    )
+    probe.add_argument(
+        "--volume-bar",
+        default=DEFAULT_VOLUME_BAR.strftime("%Y-%m-%dT%H:%M"),
+        help="начало 15м свечи (UTC) для сверки volume с TradingView",
+    )
+    probe.set_defaults(handler=cmd_bingx_probe_klines)
 
     auth = sub.add_parser(
         "bingx-auth-check",
@@ -269,6 +298,50 @@ def cmd_bingx_smoke(args: argparse.Namespace) -> int:
         args.save_raw.write_text(raw_text, encoding="utf-8")
         print(f"Сырой ответ сохранён: {args.save_raw}")
     return EXIT_OK
+
+
+def _parse_utc_minute(text: str) -> int:
+    """'2026-11-01T00:00' (UTC) -> миллисекунды."""
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return to_ms(moment.astimezone(UTC))
+
+
+def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        anchor_ms = _parse_utc_minute(args.anchor)
+        volume_bar_ms = _parse_utc_minute(args.volume_bar)
+    except (ConfigError, ValueError) as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    symbol = args.symbol or cfg.symbols.symbols[0].symbol
+    configure_logging(cfg.app.log_level)
+    now_ms = int(time.time() * 1000)
+    if anchor_ms % 900_000 or volume_bar_ms % 900_000:
+        print("ОШИБКА: --anchor и --volume-bar должны лежать на границе 15 минут", file=sys.stderr)
+        return EXIT_CONFIG
+    if anchor_ms + 1600 * 900_000 > now_ms:
+        print(
+            "ОШИБКА: --anchor слишком близко к текущему времени (нужно >= 17 суток назад)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    cases = build_cases(anchor_ms, volume_bar_ms)
+    print(f"Пробные запросы klines: {args.base_url}, символ {symbol}, запросов: {len(cases)}")
+    print(f"Опорная граница: {format_ts(anchor_ms)}; свеча для volume: {format_ts(volume_bar_ms)}")
+    print(f"Локальное время сейчас: {format_ts(now_ms)} (по часам этой машины)\n")
+    with BingXPublicClient(args.base_url) as client:
+        results = run_probe(client, symbol, cases, sleep=time.sleep)
+    for line in render_results(results):
+        print(line)
+    print("\nВыводы по этим запросам:")
+    for line in derive_findings(results, anchor_ms, now_ms, volume_bar_ms):
+        print(f"  - {line}")
+    failed = [r for r in results if r.candles is None]
+    return EXIT_FAILURE if failed and len(failed) == len(results) else EXIT_OK
 
 
 def _mask_key(key: str) -> str:
