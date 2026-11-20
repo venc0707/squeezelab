@@ -29,6 +29,8 @@ from squeezelab.app.settings import (
 )
 from squeezelab.data.bingx_rest import (
     LIVE_BASE_URL,
+    MAX_KLINES_LIMIT,
+    VALID_INTERVALS,
     VST_BASE_URL,
     BingXError,
     BingXPublicClient,
@@ -36,6 +38,13 @@ from squeezelab.data.bingx_rest import (
     describe_shape,
     extract_permissions,
     permission_fields,
+)
+from squeezelab.data.downloader import (
+    DEFAULT_START,
+    WINDOW_BARS,
+    RateLimiter,
+    download_tf,
+    render_report,
 )
 from squeezelab.data.models import (
     detect_order,
@@ -48,11 +57,14 @@ from squeezelab.data.probe import (
     DEFAULT_ANCHOR,
     DEFAULT_VOLUME_BAR,
     build_cases,
+    build_paging_cases,
     derive_findings,
+    derive_paging_findings,
     render_results,
     run_probe,
     to_ms,
 )
+from squeezelab.data.store import CandleStore, StoreError
 from squeezelab.notify.telegram import TelegramClient, TelegramError, build_test_message
 
 EXIT_OK = 0
@@ -91,6 +103,45 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser(
         "check", parents=[common], help="проверить конфиги и напечатать хэш"
     ).set_defaults(handler=cmd_config_check)
+
+    data = sub.add_parser("data", help="данные: загрузка и проверка свечей")
+    data_sub = data.add_subparsers(dest="data_command", metavar="ДЕЙСТВИЕ", required=True)
+    download = data_sub.add_parser(
+        "download",
+        parents=[common],
+        help="скачать закрытые свечи BingX в Parquet (повторный запуск докачивает)",
+    )
+    download.add_argument(
+        "--symbol",
+        action="append",
+        default=None,
+        help="пара, можно несколько раз; по умолчанию первая из symbols.yaml",
+    )
+    download.add_argument(
+        "--tf",
+        action="append",
+        default=None,
+        help="таймфрейм, можно несколько раз; по умолчанию 15m и 1m",
+    )
+    download.add_argument(
+        "--start",
+        default=DEFAULT_START.strftime("%Y-%m-%dT%H:%M"),
+        help="начало периода, UTC (ГГГГ-ММ-ДД или ГГГГ-ММ-ДДTЧЧ:ММ); по умолчанию "
+        + DEFAULT_START.strftime("%Y-%m-%d %H:%M"),
+    )
+    download.add_argument(
+        "--end",
+        default=None,
+        help="конец периода, UTC, исключительно; по умолчанию последняя закрытая свеча",
+    )
+    download.add_argument("--base-url", default=LIVE_BASE_URL, help=f"по умолчанию {LIVE_BASE_URL}")
+    download.add_argument(
+        "--window-bars",
+        type=int,
+        default=WINDOW_BARS,
+        help=f"баров в окне запроса (1..1440); по умолчанию {WINDOW_BARS} (предел ответа биржи)",
+    )
+    download.set_defaults(handler=cmd_data_download)
 
     notify = sub.add_parser(
         "notify-test",
@@ -132,6 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--volume-bar",
         default=DEFAULT_VOLUME_BAR.strftime("%Y-%m-%dT%H:%M"),
         help="начало 15м свечи (UTC) для сверки volume с TradingView",
+    )
+    probe.add_argument(
+        "--set",
+        dest="probe_set",
+        choices=("basic", "paging"),
+        default="basic",
+        help="basic: границы и порядок; paging: предел ответа, endTime, 1m, начало истории",
     )
     probe.set_defaults(handler=cmd_bingx_probe_klines)
 
@@ -322,14 +380,20 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
     if anchor_ms % 900_000 or volume_bar_ms % 900_000:
         print("ОШИБКА: --anchor и --volume-bar должны лежать на границе 15 минут", file=sys.stderr)
         return EXIT_CONFIG
-    if anchor_ms + 1600 * 900_000 > now_ms:
+    needed_bars = 1800 if args.probe_set == "paging" else 1600
+    if anchor_ms + needed_bars * 900_000 > now_ms:
         print(
-            "ОШИБКА: --anchor слишком близко к текущему времени (нужно >= 17 суток назад)",
+            "ОШИБКА: --anchor слишком близко к текущему времени "
+            f"(нужно >= {needed_bars * 15 // 60 // 24 + 1} суток назад)",
             file=sys.stderr,
         )
         return EXIT_CONFIG
 
-    cases = build_cases(anchor_ms, volume_bar_ms)
+    cases = (
+        build_paging_cases(anchor_ms)
+        if args.probe_set == "paging"
+        else build_cases(anchor_ms, volume_bar_ms)
+    )
     print(f"Пробные запросы klines: {args.base_url}, символ {symbol}, запросов: {len(cases)}")
     print(f"Опорная граница: {format_ts(anchor_ms)}; свеча для volume: {format_ts(volume_bar_ms)}")
     print(f"Локальное время сейчас: {format_ts(now_ms)} (по часам этой машины)\n")
@@ -338,10 +402,85 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
     for line in render_results(results):
         print(line)
     print("\nВыводы по этим запросам:")
-    for line in derive_findings(results, anchor_ms, now_ms, volume_bar_ms):
+    findings = (
+        derive_paging_findings(results, anchor_ms, now_ms)
+        if args.probe_set == "paging"
+        else derive_findings(results, anchor_ms, now_ms, volume_bar_ms)
+    )
+    for line in findings:
         print(f"  - {line}")
     failed = [r for r in results if r.candles is None]
     return EXIT_FAILURE if failed and len(failed) == len(results) else EXIT_OK
+
+
+def cmd_data_download(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        start_ms = _parse_utc_minute(args.start)
+        end_ms = _parse_utc_minute(args.end) if args.end else None
+    except (ConfigError, ValueError) as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    symbols: list[str] = args.symbol or [cfg.symbols.symbols[0].symbol]
+    tfs: list[str] = args.tf or ["15m", "1m"]
+    window_bars: int = args.window_bars
+    data_dir = resolve_data_dir(cfg.app)
+    store = CandleStore(data_dir.path)
+    try:
+        for tf in tfs:
+            if tf not in VALID_INTERVALS:
+                raise ValueError(f"интервал {tf!r} не из списка {sorted(VALID_INTERVALS)}")
+            for symbol in symbols:
+                store.tf_dir(symbol, tf)  # проверка вида пары и таймфрейма
+        if not 1 <= window_bars <= MAX_KLINES_LIMIT:
+            raise ValueError(f"--window-bars: ожидается число от 1 до {MAX_KLINES_LIMIT}")
+    except ValueError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level)
+
+    now_ms = int(time.time() * 1000)
+    end_text = format_ts(end_ms) if end_ms is not None else "последняя закрытая свеча"
+    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})")
+    print(f"Пары: {', '.join(symbols)}; таймфреймы: {', '.join(tfs)}")
+    print(f"Период: с {format_ts(start_ms)} до {end_text}; окно {window_bars} баров\n")
+
+    exit_code = EXIT_OK
+    gaps = 0
+    with BingXPublicClient(args.base_url) as client:
+        limiter = RateLimiter()
+        for symbol in symbols:
+            for tf in tfs:
+                try:
+                    report = download_tf(
+                        client,
+                        store,
+                        symbol,
+                        tf,
+                        start_ms,
+                        end_ms if end_ms is not None else now_ms,
+                        now_ms=now_ms,
+                        limiter=limiter,
+                        progress=print,
+                        window_bars=window_bars,
+                    )
+                except (BingXError, StoreError) as exc:
+                    print(
+                        f"{symbol} {tf}: ОШИБКА: {exc}\n"
+                        "  накопленное сохранено; повторный запуск продолжит с этого места",
+                        file=sys.stderr,
+                    )
+                    exit_code = EXIT_FAILURE
+                    continue
+                for line in render_report(report):
+                    print(line)
+                gaps += len(report.missing)
+    if gaps:
+        print(
+            f"\nПРЕДУПРЕЖДЕНИЕ: пропусков всего {gaps}. Повторный запуск попробует их докачать; "
+            "пометку «подтверждённо отсутствует» добавит проверка качества (P01-T03)."
+        )
+    return exit_code
 
 
 def _mask_key(key: str) -> str:

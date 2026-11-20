@@ -240,14 +240,14 @@ def derive_findings(
     e = by_key.get("E")
     if e is not None and e.candles:
         newest = max(x.ts_open for x in e.candles)
-        out.append(
-            "только endTime: "
-            + (
-                "самые новые свечи не позже end (E)"
-                if newest in (t + 100 * tf, t + 99 * tf)
-                else f"неожиданный состав: {_times_preview(e.candles)} (E)"
+        if newest == t + 100 * tf:
+            out.append(
+                "только endTime: самые новые свечи, свеча с временем end ВХОДИТ (включительно) (E)"
             )
-        )
+        elif newest == t + 99 * tf:
+            out.append("только endTime: самые новые свечи, свеча с временем end НЕ входит (E)")
+        else:
+            out.append(f"только endTime: неожиданный состав: {_times_preview(e.candles)} (E)")
 
     f = by_key.get("F")
     if f is not None and f.candles:
@@ -266,23 +266,31 @@ def derive_findings(
     g = by_key.get("G")
     if g is not None and g.candles is not None:
         n = len(g.candles)
+        # Окно [T, T+1500*ТФ]: 1500 свечей, если конец исключён, и 1501, если включён.
+        a_stamps = _stamps(by_key.get("A"))
+        end_inclusive = a_stamps is not None and (t + 4 * tf) in a_stamps
+        in_window = 1501 if end_inclusive else 1500
         if n == 0:
             out.append("широкое окно: пустой ответ (G)")
         else:
             lo = min(x.ts_open for x in g.candles)
             hi = max(x.ts_open for x in g.candles)
-            if n < 1500:
-                kept = (
-                    "оставлены самые ранние"
-                    if lo == t
-                    else "оставлены самые поздние"
-                    if hi == t + 1500 * tf
-                    else "состав неожиданный"
-                )
-            else:
+            window_last = t + (in_window - 1) * tf  # последняя свеча окна
+            if n >= in_window:
                 kept = "усечения нет"
+            elif lo == t:
+                kept = "остались САМЫЕ РАННИЕ, новые потеряны"
+            elif hi in (window_last, t + 1500 * tf):
+                kept = "остались САМЫЕ НОВЫЕ, ранние потеряны"
+            else:
+                kept = "состав неожиданный"
+            cap_note = (
+                f"; ответ короче limit={g.case.limit}: у биржи есть свой предел ответа"
+                if n < min(g.case.limit, in_window)
+                else ""
+            )
             out.append(
-                f"окно шире limit: получено {n} при 1500 в окне; {kept} "
+                f"окно шире ответа: получено {n} из {in_window} в окне; {kept}{cap_note} "
                 f"(G: от {_short(lo)} до {_short(hi)})"
             )
 
@@ -324,6 +332,139 @@ def derive_findings(
     out.append(
         "порядок свечей во всех ответах: " + ", ".join(sorted(_ORDER_NAMES[o] for o in orders))
     )
+    errors = [r.case.key for r in results if r.candles is None]
+    if errors:
+        out.append("запросы с ошибкой: " + ", ".join(errors))
+    return out
+
+
+# ----------------------------------------------------------- набор paging: пределы и глубина
+
+DEPTH_YEARS = (2021, 2022, 2023, 2024, 2025)
+
+
+def build_paging_cases(anchor_ms: int) -> list[ProbeCase]:
+    """Второй набор: скрытый предел ответа, границы endTime, 1m и поиск начала истории."""
+    tf = tf_to_ms("15m")
+    tf1 = tf_to_ms("1m")
+    t = anchor_ms
+    cases = [
+        ProbeCase("L1", "15m без времён, limit 1440", "15m", MAX_LIMIT),
+        ProbeCase("L2", "15m только startTime, limit 1440", "15m", MAX_LIMIT, start=t),
+        ProbeCase("L3", "15m только endTime, limit 1440", "15m", MAX_LIMIT, end=t + 1700 * tf),
+        ProbeCase("W1000", "окно ровно в 1000 баров, limit 1000", "15m", 1000, t, t + 1000 * tf),
+        ProbeCase("W1001", "окно в 1001 бар, limit 1440", "15m", MAX_LIMIT, t, t + 1001 * tf),
+        ProbeCase("W1440", "окно в 1440 баров, limit 1440", "15m", MAX_LIMIT, t, t + 1440 * tf),
+        ProbeCase("W1500", "окно в 1500 баров, limit 1000", "15m", 1000, t, t + 1500 * tf),
+        ProbeCase(
+            "E2", "только endTime на 1 мс раньше границы, limit 3", "15m", 3, end=t + 100 * tf - 1
+        ),
+        ProbeCase(
+            "E3", "только endTime на 1 мс позже границы, limit 3", "15m", 3, end=t + 100 * tf + 1
+        ),
+        ProbeCase("X1", "окно с end на 1 мс позже границы", "15m", MAX_LIMIT, t, t + 4 * tf + 1),
+        ProbeCase("M1", "1m: окно в 1440 баров, limit 1440", "1m", MAX_LIMIT, t, t + 1440 * tf1),
+        ProbeCase("M2", "1m: без времён, limit 1440", "1m", MAX_LIMIT),
+    ]
+    for year in DEPTH_YEARS:
+        cases.append(
+            ProbeCase(
+                f"R{year}",
+                f"15m: только startTime {year}-01-01, limit 1",
+                "15m",
+                1,
+                start=to_ms(datetime(year, 1, 1, tzinfo=UTC)),
+            )
+        )
+    return cases
+
+
+def derive_paging_findings(results: list[ProbeResult], anchor_ms: int, now_ms: int) -> list[str]:
+    by_key = {r.case.key: r for r in results}
+    tf = tf_to_ms("15m")
+    t = anchor_ms
+    out: list[str] = []
+
+    def count(key: str) -> int | None:
+        r = by_key.get(key)
+        return None if r is None or r.candles is None else len(r.candles)
+
+    def span(key: str) -> str:
+        r = by_key.get(key)
+        if r is None or not r.candles:
+            return "нет свечей"
+        lo = min(x.ts_open for x in r.candles)
+        hi = max(x.ts_open for x in r.candles)
+        return f"от {_short(lo)} до {_short(hi)}"
+
+    for key, label in (
+        ("L1", "15m без времён, limit 1440"),
+        ("L2", "15m только startTime, limit 1440"),
+        ("L3", "15m только endTime, limit 1440"),
+        ("W1000", "окно 1000 баров, limit 1000"),
+        ("W1001", "окно 1001 бар, limit 1440"),
+        ("W1440", "окно 1440 баров, limit 1440"),
+        ("W1500", "окно 1500 баров, limit 1000"),
+        ("M1", "1m окно 1440 баров, limit 1440"),
+        ("M2", "1m без времён, limit 1440"),
+    ):
+        n = count(key)
+        if n is not None:
+            out.append(f"{label}: получено {n}, {span(key)} ({key})")
+
+    counts = [count(k) for k in ("L1", "L2", "L3", "W1001", "W1440", "M1", "M2")]
+    known = [c for c in counts if c is not None]
+    if known:
+        out.append(f"наибольший ответ при limit=1440: {max(known)} свечей")
+
+    w1001 = by_key.get("W1001")
+    if w1001 is not None and w1001.candles:
+        lo = min(x.ts_open for x in w1001.candles)
+        if len(w1001.candles) < 1001:
+            side = "ранние" if lo > t else "новые"
+            out.append(f"окно в 1001 бар не поместилось в ответ: потеряны {side} свечи (W1001)")
+
+    for key, expected_newest, text in (
+        ("E2", t + 99 * tf, "endTime на 1 мс раньше границы"),
+        ("E3", t + 100 * tf, "endTime на 1 мс позже границы"),
+    ):
+        r = by_key.get(key)
+        if r is not None and r.candles:
+            newest = max(x.ts_open for x in r.candles)
+            verdict = (
+                "по времени открытия (open <= end)"
+                if newest == expected_newest
+                else "НЕ по времени открытия"
+            )
+            out.append(
+                f"только endTime, {text}: самая новая свеча {_short(newest)} ({key}): {verdict}"
+            )
+
+    x1 = by_key.get("X1")
+    if x1 is not None and x1.candles is not None:
+        has_boundary = (t + 4 * tf) in {c.ts_open for c in x1.candles}
+        out.append(
+            f"окно с end на 1 мс позже границы: свеча на границе "
+            f"{'ВХОДИТ' if has_boundary else 'не входит'}; получено {len(x1.candles)} (X1)"
+        )
+
+    depth: list[str] = []
+    for year in DEPTH_YEARS:
+        r = by_key.get(f"R{year}")
+        if r is None:
+            continue
+        if r.candles is None:
+            depth.append(f"{year}: ошибка")
+        elif not r.candles:
+            depth.append(f"{year}: пусто")
+        else:
+            depth.append(f"{year}: {_short(r.candles[0].ts_open)}")
+    if depth:
+        out.append(
+            "первая свеча при startTime=1 января года (пусто = биржа ничего не вернула): "
+            + "; ".join(depth)
+        )
+
     errors = [r.case.key for r in results if r.candles is None]
     if errors:
         out.append("запросы с ошибкой: " + ", ".join(errors))

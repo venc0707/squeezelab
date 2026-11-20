@@ -10,6 +10,7 @@ from typing import Literal
 
 import httpx
 import pytest
+from fake_bingx import Behaviour, FakeBingX
 
 from squeezelab.app.cli import main
 from squeezelab.data.bingx_rest import BingXPublicClient
@@ -19,7 +20,9 @@ from squeezelab.data.probe import (
     DEFAULT_VOLUME_BAR,
     ProbeCase,
     build_cases,
+    build_paging_cases,
     derive_findings,
+    derive_paging_findings,
     render_results,
     run_probe,
     to_ms,
@@ -141,8 +144,8 @@ def test_findings_for_inclusive_exchange() -> None:
     assert "start=T-1 мс: предыдущая свеча не попала, нужная вернулась" in text
     assert "отбор по времени открытия >= start (C)" in text
     assert "САМЫЕ РАННИЕ свечи от start (D)" in text
-    assert "оставлены самые поздние" in text
-    assert "получено 1440 при 1500" in text
+    assert "остались САМЫЕ НОВЫЕ, ранние потеряны" in text
+    assert "получено 1440 из 1501" in text
     assert "(G:" in text
     assert "без времён: самая новая свеча" in text
     assert "UTC UTC" not in text
@@ -168,7 +171,7 @@ def test_findings_detect_exclusive_start() -> None:
 def test_findings_detect_other_truncation_and_start_only() -> None:
     _, findings = run_all(Semantics(truncate="earliest", start_only="latest", order="asc"))
     text = "\n".join(findings)
-    assert "оставлены самые ранние" in text
+    assert "остались САМЫЕ РАННИЕ, новые потеряны" in text
     assert "САМЫЕ НОВЫЕ свечи, start лишь нижняя граница (D)" in text
     assert "порядок свечей во всех ответах: по возрастанию ts_open" in text
 
@@ -268,3 +271,108 @@ def test_cli_probe_fails_when_every_request_fails(
     code = main(["bingx-probe-klines", "--config-dir", str(REPO_CONFIG)])
     assert code == 1
     assert "запросы с ошибкой" in capsys.readouterr().out
+
+
+# ---------------------------------------------- поведение настоящей биржи (проба 2026-11-20)
+
+LISTING = to_ms(datetime(2022, 8, 1, tzinfo=UTC))  # «листинг» в фальшивой бирже
+
+
+def observed_exchange(now_ms: int | None = None) -> FakeBingX:
+    return FakeBingX(Behaviour(history_start=LISTING), now_ms or int(time.time() * 1000))
+
+
+def run_set(exchange: FakeBingX, cases: list[ProbeCase]) -> list:  # type: ignore[type-arg]
+    with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
+        return run_probe(client, "BNB-USDT", cases, sleep=lambda _s: None)
+
+
+def test_basic_findings_reproduce_the_real_probe_output() -> None:
+    """На модели наблюдённого поведения выводы те же, что напечатал настоящий BingX."""
+    exchange = observed_exchange()
+    results = run_set(exchange, build_cases(ANCHOR, VOLUME_BAR))
+    text = "\n".join(derive_findings(results, ANCHOR, exchange.now_ms, VOLUME_BAR))
+    assert "startTime включительно по времени открытия: ДА" in text
+    assert "endTime включительно по времени открытия: НЕТ" in text
+    assert "всего 4 из 5" in text
+    assert "отбор по времени открытия >= start (C)" in text
+    assert "САМЫЕ РАННИЕ свечи от start (D)" in text
+    assert "свеча с временем end ВХОДИТ" in text  # E: endTime без startTime включительно
+    assert "ещё ФОРМИРУЕТСЯ (отбрасывать)" in text
+    assert "получено 1000 из 1500 в окне" in text
+    assert "остались САМЫЕ НОВЫЕ, ранние потеряны" in text
+    assert "у биржи есть свой предел ответа" in text
+    assert "1m окно 00:00..00:09: получено 9" in text
+    assert "пересечений 0, пропусков на стыке и внутри 1" in text
+    assert "порядок свечей во всех ответах: по убыванию ts_open" in text
+    assert "start=2019-01-01" not in text  # K пуст: вывода по нему нет, как в настоящей пробе
+
+
+def test_paging_set_has_expected_cases() -> None:
+    cases = build_paging_cases(ANCHOR)
+    keys = [c.key for c in cases]
+    assert keys[:12] == [
+        "L1",
+        "L2",
+        "L3",
+        "W1000",
+        "W1001",
+        "W1440",
+        "W1500",
+        "E2",
+        "E3",
+        "X1",
+        "M1",
+        "M2",
+    ]
+    assert keys[12:] == ["R2021", "R2022", "R2023", "R2024", "R2025"]
+    assert all(1 <= c.limit <= 1440 for c in cases)
+    assert max(c.end for c in cases if c.end) < int(time.time() * 1000)  # окна целиком в прошлом
+
+
+def test_paging_findings_on_observed_behaviour() -> None:
+    exchange = observed_exchange()
+    results = run_set(exchange, build_paging_cases(ANCHOR))
+    text = "\n".join(derive_paging_findings(results, ANCHOR, exchange.now_ms))
+    assert "15m без времён, limit 1440: получено 1000" in text
+    assert "окно 1000 баров, limit 1000: получено 1000" in text
+    assert "окно 1001 бар, limit 1440: получено 1000" in text
+    assert "1m окно 1440 баров, limit 1440: получено 1000" in text
+    assert "наибольший ответ при limit=1440: 1000 свечей" in text
+    assert "потеряны ранние свечи (W1001)" in text
+    assert "endTime на 1 мс раньше границы" in text
+    assert "по времени открытия (open <= end)" in text
+    assert "свеча на границе ВХОДИТ; получено 5 (X1)" in text
+    assert "2021: пусто" in text
+    assert "2022: пусто" in text
+    assert "2023: 2023-01-01 00:00 UTC" in text
+
+
+def test_paging_findings_when_cap_is_1440() -> None:
+    exchange = FakeBingX(Behaviour(cap=1440, history_start=LISTING))
+    results = run_set(exchange, build_paging_cases(ANCHOR))
+    text = "\n".join(derive_paging_findings(results, ANCHOR, exchange.now_ms))
+    assert "наибольший ответ при limit=1440: 1440 свечей" in text
+    assert "окно 1440 баров, limit 1440: получено 1440" in text
+    assert "потеряны" not in text
+
+
+def test_cli_probe_paging_set(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_client(monkeypatch, observed_exchange().transport)
+    code = main(["bingx-probe-klines", "--set", "paging", "--config-dir", str(REPO_CONFIG)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "запросов: 17" in out
+    assert "[W1001]" in out
+    assert "наибольший ответ при limit=1440: 1000 свечей" in out
+
+
+def test_cli_probe_paging_needs_older_anchor(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_client(monkeypatch, observed_exchange().transport)
+    anchor = (datetime.now(UTC) - timedelta(days=18)).strftime("%Y-%m-%dT%H:00")
+    assert main(["bingx-probe-klines", "--set", "paging", "--anchor", anchor]) == 2
+    assert "слишком близко" in capsys.readouterr().err
