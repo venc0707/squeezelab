@@ -4,12 +4,13 @@
 (BNB-USDT, 15m и 1m; `bingx-probe-klines`):
 
 - окно startTime+endTime: свеча по времени открытия, `start` включительно, `end` исключительно;
-- в ответ попадает не больше 1000 свечей (при `limit` до 1440), а если в окне их больше,
-  остаются САМЫЕ НОВЫЕ (ранние теряются);
-- только `startTime`: самые ранние свечи от start; только `endTime`: самые новые, end включительно;
+- в ответ попадает не больше 1000 свечей для 15m и не больше 1440 для 1m (при `limit` до 1440),
+  а если в окне их больше, остаются САМЫЕ НОВЫЕ (ранние теряются);
+- только `startTime`: самые ранние свечи от start; только `endTime`: самые новые, причём end
+  округляется ВВЕРХ до границы свечи и свеча на границе входит;
 - без времён: самые новые свечи, включая формирующуюся;
 - порядок в ответе: новые первыми;
-- `startTime` далеко до листинга (2019 год): пустой ответ.
+- `startTime` раньше начала истории (2019–2025 годы): пустой ответ, а не самые ранние свечи.
 
 Остальные варианты (`Behaviour`) нужны, чтобы проверить, что код не ломается молча, если биржа
 изменит поведение.
@@ -30,9 +31,10 @@ from squeezelab.data.models import tf_to_ms
 @dataclass(frozen=True)
 class Behaviour:
     cap: int = 1000
+    caps: tuple[tuple[str, int], ...] = (("1m", 1440),)  # предел ответа по интервалам
     start_inclusive: bool = True
     end_exclusive_with_start: bool = True
-    end_inclusive_alone: bool = True
+    end_alone_rounds_up: bool = True  # endTime без startTime: вверх до границы, включительно
     start_only: Literal["earliest", "latest"] = "earliest"
     windowed_truncate: Literal["latest", "earliest"] = "latest"
     order: Literal["desc", "asc"] = "desc"
@@ -95,7 +97,8 @@ class FakeBingX:
             )
         start = int(params["startTime"]) if "startTime" in params else None
         end = int(params["endTime"]) if "endTime" in params else None
-        opens = self._select(tf_ms, min(limit, self.behaviour.cap), start, end)
+        cap = dict(self.behaviour.caps).get(params["interval"], self.behaviour.cap)
+        opens = self._select(tf_ms, min(limit, cap), start, end)
         if self.behaviour.order == "desc":
             opens.reverse()
         data = [bar_values(ts, tf_ms) for ts in opens]
@@ -119,12 +122,12 @@ class FakeBingX:
             if not b.start_inclusive and first == start:
                 first += tf_ms
         last = newest
-        if end is not None:
-            exclusive = (
-                b.end_exclusive_with_start if start is not None else not b.end_inclusive_alone
-            )
+        if end is not None and start is None:
+            rounded = -(-end // tf_ms) * tf_ms if b.end_alone_rounds_up else end - end % tf_ms
+            last = min(newest, rounded)
+        elif end is not None:
             last = min(newest, end - end % tf_ms)
-            if exclusive and end % tf_ms == 0:
+            if b.end_exclusive_with_start and end % tf_ms == 0:
                 last -= tf_ms
         if start is not None and end is None:
             keep = b.start_only

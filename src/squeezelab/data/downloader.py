@@ -13,6 +13,10 @@
 времени (ничего не принимается на веру). Повторный запуск пропускает окна, которые уже целиком
 лежат в хранилище, и докачивает остальные.
 
+Если `start` раньше начала истории пары, биржа отдаёт на такой запрос пустой ответ и теряются
+даже те свечи окна, которые у неё есть. Поэтому, когда на `start` и позже свечей нет, начало
+истории ищется бисекцией (`data/history.py`), и период начинается с самой ранней свечи.
+
 Закрытость свечи определяется дважды: по часам этой машины и по самой новой свече, которую
 отдаёт биржа (она формирующаяся). Берётся более строгая граница, поэтому сбитые часы не дадут
 записать недозакрытую свечу.
@@ -29,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from squeezelab.data.bingx_rest import BingXPublicClient
+from squeezelab.data.history import find_history_start
 from squeezelab.data.models import Candle, format_ts, is_candle_closed, tf_to_ms
 from squeezelab.data.store import CandleStore, WriteStats
 
@@ -80,6 +85,9 @@ class DownloadReport:
     dropped_unclosed: int = 0
     dropped_out_of_range: int = 0
     window_bars: int = WINDOW_BARS
+    requested_start_ms: int = 0  # начало, как его запросили (выровнено вверх по сетке ТФ)
+    start_clamped: bool = False  # начало сдвинуто на начало истории пары
+    no_data: bool = False  # у биржи нет свечей в запрошенном периоде
     exchange_newest_ms: int | None = (
         None  # ts_open самой новой свечи в ответе биржи (формирующейся)
     )
@@ -169,7 +177,9 @@ def download_tf(
     tf_ms = tf_to_ms(tf)
     start = align_up(start_ms, tf_ms)
     end = min(align_down(end_ms, tf_ms), align_down(now_ms, tf_ms))
-    report = DownloadReport(symbol, tf, start, max(start, end), window_bars=window_bars)
+    report = DownloadReport(
+        symbol, tf, start, max(start, end), window_bars=window_bars, requested_start_ms=start
+    )
     if end <= start:
         return report
     # Граница по бирже: самая новая свеча в выдаче формирующаяся, закрытые лежат строго раньше.
@@ -185,8 +195,26 @@ def download_tf(
             report.end_ms = max(start, end)
             if end <= start:
                 return report
-    report.expected = (end - start) // tf_ms
     existing = store.timestamps(symbol, tf)
+    if start not in existing:
+        # Есть ли у биржи свечи не раньше start? Если нет, start раньше начала истории.
+        limiter.wait()
+        probe = client.fetch_klines(symbol, tf, 1, start_time=start).candles
+        report.requests += 1
+        if not probe:
+            history = find_history_start(client, symbol, tf, start, end - tf_ms, wait=limiter.wait)
+            report.requests += history.requests
+            if history.first_ts is None:
+                report.no_data = True
+                report.start_ms = report.end_ms = start
+                return report
+            start = max(start, history.first_ts)
+            report.start_ms = start
+            report.start_clamped = start > report.requested_start_ms
+            if end <= start:
+                report.end_ms = start
+                return report
+    report.expected = (end - start) // tf_ms
     windows = plan_windows(start, end, tf_ms, window_bars)
     report.windows = len(windows)
 
@@ -224,6 +252,11 @@ def download_tf(
 
 
 def render_report(report: DownloadReport) -> list[str]:
+    if report.no_data:
+        return [
+            f"{report.symbol} {report.tf}: у биржи нет свечей в периоде с "
+            f"{format_ts(report.requested_start_ms)}: нечего загружать"
+        ]
     if report.expected == 0:
         return [f"{report.symbol} {report.tf}: нечего загружать (период пуст или ещё не закрыт)"]
     lines = [
@@ -237,6 +270,11 @@ def render_report(report: DownloadReport) -> list[str]:
         f"без изменений {report.stats.unchanged}, файлов записано {report.stats.files_written}",
         f"  в хранилище за период: {report.stored} из {report.expected}",
     ]
+    if report.start_clamped:
+        lines.append(
+            f"  ВНИМАНИЕ: у биржи нет свечей раньше {format_ts(report.start_ms)}; "
+            f"период начат с неё (запрошено с {format_ts(report.requested_start_ms)})"
+        )
     if report.end_cut_by_exchange and report.exchange_newest_ms is not None:
         lines.append(
             "  ВНИМАНИЕ: конец периода урезан по свече биржи "

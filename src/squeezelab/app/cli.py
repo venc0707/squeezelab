@@ -58,9 +58,12 @@ from squeezelab.data.probe import (
     DEFAULT_VOLUME_BAR,
     build_cases,
     build_paging_cases,
+    derive_depth_findings,
     derive_findings,
     derive_paging_findings,
+    render_depth,
     render_results,
+    run_depth_probe,
     run_probe,
     to_ms,
 )
@@ -187,9 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--set",
         dest="probe_set",
-        choices=("basic", "paging"),
+        choices=("basic", "paging", "depth"),
         default="basic",
-        help="basic: границы и порядок; paging: предел ответа, endTime, 1m, начало истории",
+        help="basic: границы и порядок; paging: предел ответа, endTime, 1m; "
+        "depth: начало истории 15m, 1m, 1h, 4h, 1d (бисекция)",
     )
     probe.set_defaults(handler=cmd_bingx_probe_klines)
 
@@ -380,7 +384,7 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
     if anchor_ms % 900_000 or volume_bar_ms % 900_000:
         print("ОШИБКА: --anchor и --volume-bar должны лежать на границе 15 минут", file=sys.stderr)
         return EXIT_CONFIG
-    needed_bars = 1800 if args.probe_set == "paging" else 1600
+    needed_bars = {"paging": 1800, "depth": 96}.get(args.probe_set, 1600)
     if anchor_ms + needed_bars * 900_000 > now_ms:
         print(
             "ОШИБКА: --anchor слишком близко к текущему времени "
@@ -388,6 +392,9 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_CONFIG
+
+    if args.probe_set == "depth":
+        return _probe_depth(args, symbol, anchor_ms, now_ms)
 
     cases = (
         build_paging_cases(anchor_ms)
@@ -411,6 +418,21 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
         print(f"  - {line}")
     failed = [r for r in results if r.candles is None]
     return EXIT_FAILURE if failed and len(failed) == len(results) else EXIT_OK
+
+
+def _probe_depth(args: argparse.Namespace, symbol: str, high_ms: int, now_ms: int) -> int:
+    print(f"Поиск начала истории: {args.base_url}, символ {symbol}")
+    print(f"Верхняя граница поиска (свечи там есть): {format_ts(high_ms)}")
+    print(f"Локальное время сейчас: {format_ts(now_ms)} (по часам этой машины)\n")
+    with BingXPublicClient(args.base_url) as client:
+        results = run_depth_probe(client, symbol, high_ms, sleep=time.sleep)
+    for line in render_depth(results):
+        print(line)
+    print("\nВыводы по этим запросам:")
+    for line in derive_depth_findings(results, now_ms):
+        print(f"  - {line}")
+    failed = [r for r in results if r.history is None]
+    return EXIT_FAILURE if len(failed) == len(results) else EXIT_OK
 
 
 def cmd_data_download(args: argparse.Namespace) -> int:

@@ -153,8 +153,8 @@ def test_full_15m_download_matches_exchange_and_skips_forming_candle(store: Cand
     assert not report.end_cut_by_exchange
     assert_matches_exchange(store, "15m", START, FORMING_15M)
     assert store.timestamps(SYMBOL, "15m").isdisjoint({FORMING_15M})
-    # запросов: один на границу по бирже + по одному на окно (без повторов)
-    assert report.requests == 1 + report.windows == len(exchange.requests)
+    # запросов: граница по бирже, проверка начала + по одному на окно (без повторов)
+    assert report.requests == 2 + report.windows == len(exchange.requests)
 
 
 def test_pagination_across_exchange_cap_gives_complete_contiguous_data(store: CandleStore) -> None:
@@ -323,12 +323,76 @@ def test_response_order_does_not_matter(store: CandleStore, order: str) -> None:
     assert_matches_exchange(store, "15m", START, FORMING_15M)
 
 
+# ------------------------------------------------------------- начало истории пары
+
+
+def test_start_before_history_is_clamped_and_nothing_is_lost(store: CandleStore) -> None:
+    listing = START + 50 * 900_000
+    exchange = FakeBingX(Behaviour(history_start=listing), now_ms=NOW)
+    report = run_download(exchange, store)
+    assert report.start_clamped
+    assert report.requested_start_ms == START
+    assert report.start_ms == listing
+    assert report.expected == (FORMING_15M - listing) // 900_000
+    assert report.stored == report.expected
+    assert report.missing == []
+    assert min(store.timestamps(SYMBOL, "15m")) == listing
+    assert_matches_exchange(store, "15m", listing, FORMING_15M)
+    text = "\n".join(render_report(report))
+    assert "ВНИМАНИЕ: у биржи нет свечей раньше 2026-11-17 12:30:00 UTC" in text
+
+
+def test_history_starting_inside_the_first_window_does_not_lose_that_window(
+    store: CandleStore,
+) -> None:
+    listing = LONG_START + 500 * 900_000  # первое окно в 1000 баров начинается до листинга
+    exchange = FakeBingX(Behaviour(history_start=listing), now_ms=NOW)
+    report = run_download(exchange, store, "15m", LONG_START)
+    assert report.start_clamped
+    assert report.missing == []
+    assert report.stored == report.expected
+    assert_matches_exchange(store, "15m", listing, FORMING_15M)
+
+
+def test_no_data_at_all_is_reported_without_writing(store: CandleStore) -> None:
+    exchange = FakeBingX(Behaviour(history_start=NOW + 86_400_000), now_ms=NOW)
+    report = run_download(exchange, store)
+    assert report.no_data
+    assert report.expected == 0
+    assert store.month_files(SYMBOL, "15m") == []
+    assert "у биржи нет свечей в периоде" in render_report(report)[0]
+
+
+def test_start_probe_is_skipped_when_the_start_candle_is_already_stored(
+    store: CandleStore,
+) -> None:
+    run_download(FakeBingX(now_ms=NOW), store)
+    again = FakeBingX(now_ms=NOW)
+    report = run_download(again, store)
+    assert report.requests == 1  # только граница по бирже
+    assert not report.start_clamped
+
+
+def test_rerun_with_early_start_clamps_again_without_refetching_data(
+    store: CandleStore,
+) -> None:
+    listing = START + 50 * 900_000
+    run_download(FakeBingX(Behaviour(history_start=listing), now_ms=NOW), store)
+    second = FakeBingX(Behaviour(history_start=listing), now_ms=NOW)
+    report = run_download(second, store)  # снова с START, раньше начала истории
+    assert report.start_clamped
+    assert report.stats.added == 0
+    assert report.windows_skipped == report.windows
+    assert second.data_requests() == []  # данные не запрашивались повторно
+
+
 # ----------------------------------------------------------------------- сбой API
 
 
 def test_api_error_keeps_progress_and_rerun_finishes(store: CandleStore) -> None:
     start, end = ms(2026, 11, 17), ms(2026, 11, 19, 12)  # 1m, четыре окна
-    exchange = FakeBingX(now_ms=NOW, fail_after=3)  # граница + два окна проходят, третье падает
+    # граница, проверка начала и два окна проходят, третье окно падает
+    exchange = FakeBingX(now_ms=NOW, fail_after=4)
     with pytest.raises(BingXError):
         run_download(exchange, store, "1m", start, end)
     saved = store.timestamps(SYMBOL, "1m")
@@ -430,6 +494,18 @@ def test_cli_reports_gaps_and_still_exits_zero(
     out = capsys.readouterr().out
     assert "ПРОПУСКИ (1): 2026-11-17 03:00:00 UTC" in out
     assert "ПРЕДУПРЕЖДЕНИЕ: пропусков всего 1" in out
+
+
+def test_cli_reports_clamped_start(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    listing = ms(2026, 11, 17, 6)
+    _patch_cli(monkeypatch, FakeBingX(Behaviour(history_start=listing)), tmp_path)
+    assert main(ARGS) == 0
+    out = capsys.readouterr().out
+    assert "ВНИМАНИЕ: у биржи нет свечей раньше 2026-11-17 06:00:00 UTC" in out
+    assert "ожидается свечей: 72" in out
+    assert "пропусков нет" in out
 
 
 def test_cli_api_failure_exits_one_and_keeps_what_was_saved(

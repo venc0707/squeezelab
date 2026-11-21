@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from itertools import pairwise
 
 from squeezelab.data.bingx_rest import BingXError, BingXPublicClient
+from squeezelab.data.history import HistoryStart, find_history_start
 from squeezelab.data.models import Candle, detect_order, format_ts, is_candle_closed, tf_to_ms
 
 DEFAULT_ANCHOR = datetime(2026, 11, 1, tzinfo=UTC)  # граница любого ТФ до 1d включительно
@@ -412,10 +413,13 @@ def derive_paging_findings(results: list[ProbeResult], anchor_ms: int, now_ms: i
         if n is not None:
             out.append(f"{label}: получено {n}, {span(key)} ({key})")
 
-    counts = [count(k) for k in ("L1", "L2", "L3", "W1001", "W1440", "M1", "M2")]
-    known = [c for c in counts if c is not None]
-    if known:
-        out.append(f"наибольший ответ при limit=1440: {max(known)} свечей")
+    caps = []
+    for interval, keys in (("15m", ("L1", "L2", "L3", "W1001", "W1440")), ("1m", ("M1", "M2"))):
+        known = [c for c in (count(k) for k in keys) if c is not None]
+        if known:
+            caps.append(f"{interval}: {max(known)} свечей")
+    if caps:
+        out.append("наибольший ответ при limit=1440: " + "; ".join(caps))
 
     w1001 = by_key.get("W1001")
     if w1001 is not None and w1001.candles:
@@ -424,18 +428,19 @@ def derive_paging_findings(results: list[ProbeResult], anchor_ms: int, now_ms: i
             side = "ранние" if lo > t else "новые"
             out.append(f"окно в 1001 бар не поместилось в ответ: потеряны {side} свечи (W1001)")
 
-    for key, expected_newest, text in (
-        ("E2", t + 99 * tf, "endTime на 1 мс раньше границы"),
-        ("E3", t + 100 * tf, "endTime на 1 мс позже границы"),
+    for key, end_ms, text in (
+        ("E2", t + 100 * tf - 1, "endTime на 1 мс раньше границы"),
+        ("E3", t + 100 * tf + 1, "endTime на 1 мс позже границы"),
     ):
         r = by_key.get(key)
         if r is not None and r.candles:
             newest = max(x.ts_open for x in r.candles)
-            verdict = (
-                "по времени открытия (open <= end)"
-                if newest == expected_newest
-                else "НЕ по времени открытия"
-            )
+            if newest == -(-end_ms // tf) * tf:
+                verdict = "endTime округляется ВВЕРХ до границы свечи, свеча на границе входит"
+            elif newest == end_ms - end_ms % tf:
+                verdict = "endTime округляется вниз до границы свечи, свеча на границе входит"
+            else:
+                verdict = "неожиданный состав"
             out.append(
                 f"только endTime, {text}: самая новая свеча {_short(newest)} ({key}): {verdict}"
             )
@@ -459,6 +464,14 @@ def derive_paging_findings(results: list[ProbeResult], anchor_ms: int, now_ms: i
             depth.append(f"{year}: пусто")
         else:
             depth.append(f"{year}: {_short(r.candles[0].ts_open)}")
+    all_empty = all(
+        r.candles is not None and not r.candles for r in results if r.case.key.startswith("R")
+    )
+    if depth and all_empty:
+        out.append(
+            "при startTime раньше начала истории биржа отдаёт ПУСТОЙ ответ, а не самые ранние "
+            "свечи: начало истории ищется бисекцией (`--set depth`)"
+        )
     if depth:
         out.append(
             "первая свеча при startTime=1 января года (пусто = биржа ничего не вернула): "
@@ -468,4 +481,110 @@ def derive_paging_findings(results: list[ProbeResult], anchor_ms: int, now_ms: i
     errors = [r.case.key for r in results if r.candles is None]
     if errors:
         out.append("запросы с ошибкой: " + ", ".join(errors))
+    return out
+
+
+# ------------------------------------------------- набор depth: начало истории по ТФ
+
+DEPTH_INTERVALS = ("15m", "1m", "1h", "4h", "1d")
+TARGET_15M_DAYS = 365 + 200  # цель мастера: 12 месяцев плюс 200 суток прогрева (поправка A)
+_DAY_MS = 86_400_000
+
+
+@dataclass(frozen=True, slots=True)
+class DepthResult:
+    interval: str
+    history: HistoryStart | None
+    newest_count: int | None = None  # сколько свечей пришло на запрос без времён, limit=1440
+    error: str | None = None
+
+
+def run_depth_probe(
+    client: BingXPublicClient,
+    symbol: str,
+    high_ms: int,
+    *,
+    intervals: tuple[str, ...] = DEPTH_INTERVALS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[DepthResult]:
+    """Для каждого ТФ ищет самую раннюю свечу бисекцией по startTime и меряет предел ответа."""
+    results: list[DepthResult] = []
+    low_ms = to_ms(FAR_PAST)
+
+    def pause() -> None:
+        sleep(PAUSE_S)
+
+    for interval in intervals:
+        try:
+            history = find_history_start(client, symbol, interval, low_ms, high_ms, wait=pause)
+            pause()
+            newest = client.fetch_klines(symbol, interval, MAX_LIMIT).candles
+        except BingXError as exc:
+            results.append(DepthResult(interval, None, error=str(exc)))
+            continue
+        results.append(DepthResult(interval, history, newest_count=len(newest)))
+    return results
+
+
+def render_depth(results: list[DepthResult]) -> list[str]:
+    lines: list[str] = []
+    for result in results:
+        lines.append(f"[{result.interval}] начало истории (бисекция по startTime, limit=1)")
+        if result.history is None:
+            lines.append(f"    ОШИБКА: {result.error}")
+            continue
+        history = result.history
+        tail = ", ".join(
+            f"{_short(start)} {'есть' if found else 'пусто'}" for start, found in history.steps[-4:]
+        )
+        lines.append(f"    запросов: {history.requests}; последние шаги: {tail}")
+        if history.first_ts is None:
+            lines.append("    свечей нет даже при самом позднем start")
+        else:
+            lines.append(f"    самая ранняя свеча: {_short(history.first_ts)} ({history.first_ts})")
+        lines.append(f"    без времён, limit=1440: получено {result.newest_count}")
+    return lines
+
+
+def derive_depth_findings(results: list[DepthResult], now_ms: int) -> list[str]:
+    out: list[str] = []
+    firsts: dict[str, int] = {}
+    for r in results:
+        if r.history is None:
+            out.append(f"{r.interval}: ошибка запроса")
+            continue
+        h = r.history
+        if h.first_ts is None:
+            out.append(f"{r.interval}: свечей нет")
+            continue
+        firsts[r.interval] = h.first_ts
+        days = (now_ms - h.first_ts) / _DAY_MS
+        note = (
+            " (история глубже 2019-01-01, граница поиска)" if h.reason == "deeper_than_low" else ""
+        )
+        out.append(
+            f"{r.interval}: самая ранняя свеча {_short(h.first_ts)}, это {days:.0f} суток "
+            f"назад ({days / 30.44:.1f} мес.), запросов на поиск {h.requests}{note}"
+        )
+    if "15m" in firsts:
+        days = (now_ms - firsts["15m"]) / _DAY_MS
+        verdict = (
+            "ДОСТАТОЧНО" if days >= TARGET_15M_DAYS else f"НЕДОСТАТОЧНО: доступно {days:.0f} суток"
+        )
+        out.append(
+            f"цель по глубине 15m ({TARGET_15M_DAYS} суток: 12 мес. + 200 суток прогрева): "
+            f"{verdict}"
+        )
+    if "15m" in firsts and "1m" in firsts:
+        shift = (firsts["1m"] - firsts["15m"]) / _DAY_MS
+        out.append(f"начало 1m относительно 15m: {shift:+.1f} суток (0 = совпадает)")
+    native = [i for i in ("1h", "4h", "1d") if i in firsts]
+    if native and "15m" in firsts:
+        parts = [f"{i}: {(firsts[i] - firsts['15m']) / _DAY_MS:+.1f}" for i in native]
+        out.append("начало нативных ТФ относительно 15m, суток: " + "; ".join(parts))
+    caps = [f"{r.interval}: {r.newest_count}" for r in results if r.newest_count is not None]
+    if caps:
+        out.append(
+            "без времён, limit=1440 (предел ответа, если истории хватает): " + "; ".join(caps)
+        )
     return out

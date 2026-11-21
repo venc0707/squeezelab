@@ -18,12 +18,16 @@ from squeezelab.data.models import tf_to_ms
 from squeezelab.data.probe import (
     DEFAULT_ANCHOR,
     DEFAULT_VOLUME_BAR,
+    DEPTH_INTERVALS,
     ProbeCase,
     build_cases,
     build_paging_cases,
+    derive_depth_findings,
     derive_findings,
     derive_paging_findings,
+    render_depth,
     render_results,
+    run_depth_probe,
     run_probe,
     to_ms,
 )
@@ -337,11 +341,13 @@ def test_paging_findings_on_observed_behaviour() -> None:
     assert "15m без времён, limit 1440: получено 1000" in text
     assert "окно 1000 баров, limit 1000: получено 1000" in text
     assert "окно 1001 бар, limit 1440: получено 1000" in text
-    assert "1m окно 1440 баров, limit 1440: получено 1000" in text
-    assert "наибольший ответ при limit=1440: 1000 свечей" in text
+    assert "1m окно 1440 баров, limit 1440: получено 1440" in text
+    assert "ПУСТОЙ ответ" not in text  # в фальшивой бирже 2023 год уже не пуст
+    assert "наибольший ответ при limit=1440: 15m: 1000 свечей; 1m: 1440 свечей" in text
     assert "потеряны ранние свечи (W1001)" in text
-    assert "endTime на 1 мс раньше границы" in text
-    assert "по времени открытия (open <= end)" in text
+    assert "endTime на 1 мс раньше границы: самая новая свеча 2026-11-02 01:00 UTC (E2)" in text
+    assert "endTime на 1 мс позже границы: самая новая свеча 2026-11-02 01:15 UTC (E3)" in text
+    assert "endTime округляется ВВЕРХ до границы свечи" in text
     assert "свеча на границе ВХОДИТ; получено 5 (X1)" in text
     assert "2021: пусто" in text
     assert "2022: пусто" in text
@@ -352,7 +358,7 @@ def test_paging_findings_when_cap_is_1440() -> None:
     exchange = FakeBingX(Behaviour(cap=1440, history_start=LISTING))
     results = run_set(exchange, build_paging_cases(ANCHOR))
     text = "\n".join(derive_paging_findings(results, ANCHOR, exchange.now_ms))
-    assert "наибольший ответ при limit=1440: 1440 свечей" in text
+    assert "наибольший ответ при limit=1440: 15m: 1440 свечей; 1m: 1440 свечей" in text
     assert "окно 1440 баров, limit 1440: получено 1440" in text
     assert "потеряны" not in text
 
@@ -366,7 +372,7 @@ def test_cli_probe_paging_set(
     assert code == 0
     assert "запросов: 17" in out
     assert "[W1001]" in out
-    assert "наибольший ответ при limit=1440: 1000 свечей" in out
+    assert "наибольший ответ при limit=1440: 15m: 1000 свечей; 1m: 1440 свечей" in out
 
 
 def test_cli_probe_paging_needs_older_anchor(
@@ -376,3 +382,84 @@ def test_cli_probe_paging_needs_older_anchor(
     anchor = (datetime.now(UTC) - timedelta(days=18)).strftime("%Y-%m-%dT%H:00")
     assert main(["bingx-probe-klines", "--set", "paging", "--anchor", anchor]) == 2
     assert "слишком близко" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------- набор depth
+
+
+def run_depth(listing: int, **kwargs: object) -> tuple[list, FakeBingX]:  # type: ignore[type-arg]
+    exchange = FakeBingX(Behaviour(history_start=listing), **kwargs)  # type: ignore[arg-type]
+    with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
+        results = run_depth_probe(client, "BNB-USDT", ANCHOR, sleep=lambda _s: None)
+    return results, exchange
+
+
+def test_depth_probe_finds_every_interval_and_measures_caps() -> None:
+    listing = to_ms(datetime(2025, 3, 9, tzinfo=UTC))
+    results, exchange = run_depth(listing)
+    assert [r.interval for r in results] == list(DEPTH_INTERVALS)
+    for r in results:
+        assert r.history is not None
+        assert r.history.first_ts == listing
+        assert r.history.reason == "found"
+    caps = {r.interval: r.newest_count for r in results}
+    assert caps["15m"] == 1000
+    assert caps["1m"] == 1440
+    text = "\n".join(derive_depth_findings(results, exchange.now_ms))
+    assert "15m: самая ранняя свеча 2025-03-09 00:00 UTC" in text
+    assert "ДОСТАТОЧНО" in text  # 2025-03-09 .. 2026-11: больше 565 суток
+    assert "начало 1m относительно 15m: +0.0 суток" in text
+    assert "1d: самая ранняя свеча 2025-03-09 00:00 UTC" in text
+    assert "15m: 1000; 1m: 1440" in text
+
+
+def test_depth_findings_say_when_history_is_too_short() -> None:
+    listing = to_ms(datetime(2026, 4, 1, tzinfo=UTC))
+    results, exchange = run_depth(listing)
+    text = "\n".join(derive_depth_findings(results, exchange.now_ms))
+    assert "НЕДОСТАТОЧНО: доступно" in text
+    assert "ДОСТАТОЧНО" not in text.replace("НЕДОСТАТОЧНО", "")
+
+
+def test_depth_report_lists_steps_and_first_candle() -> None:
+    listing = to_ms(datetime(2025, 3, 9, tzinfo=UTC))
+    results, _ = run_depth(listing)
+    lines = render_depth(results)
+    assert "[15m] начало истории (бисекция по startTime, limit=1)" in lines
+    assert any("самая ранняя свеча: 2025-03-09 00:00 UTC" in line for line in lines)
+    assert any("без времён, limit=1440: получено 1000" in line for line in lines)
+
+
+def test_depth_probe_survives_an_error_in_one_interval() -> None:
+    listing = to_ms(datetime(2025, 3, 9, tzinfo=UTC))
+    exchange = FakeBingX(Behaviour(history_start=listing), fail_after=5)
+    with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
+        results = run_depth_probe(
+            client, "BNB-USDT", ANCHOR, intervals=("15m", "1d"), sleep=lambda _s: None
+        )
+    assert results[0].history is None
+    assert results[0].error is not None
+    assert "ОШИБКА" in "\n".join(render_depth(results))
+    assert "15m: ошибка запроса" in "\n".join(derive_depth_findings(results, exchange.now_ms))
+
+
+def test_cli_probe_depth_set(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listing = to_ms(datetime(2025, 3, 9, tzinfo=UTC))
+    _patch_client(monkeypatch, FakeBingX(Behaviour(history_start=listing)).transport)
+    code = main(["bingx-probe-klines", "--set", "depth", "--config-dir", str(REPO_CONFIG)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Поиск начала истории" in out
+    assert "[1d] начало истории" in out
+    assert "цель по глубине 15m (565 суток: 12 мес. + 200 суток прогрева): ДОСТАТОЧНО" in out
+
+
+def test_cli_probe_depth_fails_when_every_request_fails(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_client(monkeypatch, FakeBingX(fail_after=0).transport)
+    code = main(["bingx-probe-klines", "--set", "depth", "--config-dir", str(REPO_CONFIG)])
+    assert code == 1
+    assert "ошибка запроса" in capsys.readouterr().out
