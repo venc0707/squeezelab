@@ -42,6 +42,9 @@ class Behaviour:
     holes: frozenset[int] = frozenset()  # свечи, которых у биржи нет (ts_open)
     offgrid: bool = False  # добавлять в ответ свечу не по сетке (аномалия)
     start_before_history_is_empty: bool = True  # start до листинга даёт пустой ответ
+    # Гипотеза «только startTime = окно из limit слотов»: пустой ответ, если в слотах нет свечей
+    # (например, дыра в данных), хотя позже свечи есть. Настоящая биржа не проверена.
+    start_only_window: bool = False
 
 
 def bar_values(ts_open: int, tf_ms: int) -> dict[str, object]:
@@ -129,6 +132,8 @@ class FakeBingX:
             last = min(newest, end - end % tf_ms)
             if b.end_exclusive_with_start and end % tf_ms == 0:
                 last -= tf_ms
+        if start is not None and end is None and b.start_only_window:
+            last = min(last, first + (n - 1) * tf_ms)
         if start is not None and end is None:
             keep = b.start_only
         elif start is not None:

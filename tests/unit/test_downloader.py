@@ -383,7 +383,27 @@ def test_rerun_with_early_start_clamps_again_without_refetching_data(
     assert report.start_clamped
     assert report.stats.added == 0
     assert report.windows_skipped == report.windows
-    assert second.data_requests() == []  # данные не запрашивались повторно
+    # данные окон не запрашивались; был лишь проверочный запрос окна `[start, начало истории)`
+    assert [r for r in second.data_requests() if int(r["limit"]) > 1] == []
+
+
+def test_clamp_is_refused_when_window_check_finds_earlier_candles(
+    store: CandleStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Бисекция могла ошибиться из-за пропусков в данных биржи: период тогда не урезается."""
+    from squeezelab.data.history import HistoryStart
+
+    # Гипотеза «только startTime = окно из limit слотов»: дыра в слоте START даёт пустой ответ.
+    exchange = FakeBingX(Behaviour(start_only_window=True, holes=frozenset({START})), now_ms=NOW)
+    wrong = HistoryStart("15m", START + 10 * 900_000, "found", ((START, False),))
+    monkeypatch.setattr("squeezelab.data.downloader.find_history_start", lambda *_a, **_k: wrong)
+    report = run_download(exchange, store)
+    assert report.history_conflict_ts == START + 10 * 900_000
+    assert not report.start_clamped
+    assert report.start_ms == START
+    assert report.missing == [START]  # единственная настоящая дыра
+    assert report.stored == report.expected - 1
+    assert any("период НЕ урезан" in line for line in render_report(report))
 
 
 # ----------------------------------------------------------------------- сбой API

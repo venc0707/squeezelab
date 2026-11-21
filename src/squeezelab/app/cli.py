@@ -58,11 +58,15 @@ from squeezelab.data.probe import (
     DEFAULT_VOLUME_BAR,
     build_cases,
     build_paging_cases,
+    coverage_samples,
+    derive_coverage_findings,
     derive_depth_findings,
     derive_findings,
     derive_paging_findings,
+    render_coverage,
     render_depth,
     render_results,
+    run_coverage_probe,
     run_depth_probe,
     run_probe,
     to_ms,
@@ -190,10 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--set",
         dest="probe_set",
-        choices=("basic", "paging", "depth"),
+        choices=("basic", "paging", "depth", "coverage"),
         default="basic",
-        help="basic: границы и порядок; paging: предел ответа, endTime, 1m; "
-        "depth: начало истории 15m, 1m, 1h, 4h, 1d (бисекция)",
+        help="basic: границы и порядок; paging: предел ответа, endTime, 1m; depth: начало "
+        "истории 15m, 1m, 1h, 4h, 1d (бисекция); coverage: карта наличия данных по месяцам",
     )
     probe.set_defaults(handler=cmd_bingx_probe_klines)
 
@@ -384,7 +388,7 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
     if anchor_ms % 900_000 or volume_bar_ms % 900_000:
         print("ОШИБКА: --anchor и --volume-bar должны лежать на границе 15 минут", file=sys.stderr)
         return EXIT_CONFIG
-    needed_bars = {"paging": 1800, "depth": 96}.get(args.probe_set, 1600)
+    needed_bars = {"paging": 1800, "depth": 96, "coverage": 96}.get(args.probe_set, 1600)
     if anchor_ms + needed_bars * 900_000 > now_ms:
         print(
             "ОШИБКА: --anchor слишком близко к текущему времени "
@@ -395,6 +399,8 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
 
     if args.probe_set == "depth":
         return _probe_depth(args, symbol, anchor_ms, now_ms)
+    if args.probe_set == "coverage":
+        return _probe_coverage(args, symbol, now_ms)
 
     cases = (
         build_paging_cases(anchor_ms)
@@ -433,6 +439,22 @@ def _probe_depth(args: argparse.Namespace, symbol: str, high_ms: int, now_ms: in
         print(f"  - {line}")
     failed = [r for r in results if r.history is None]
     return EXIT_FAILURE if len(failed) == len(results) else EXIT_OK
+
+
+def _probe_coverage(args: argparse.Namespace, symbol: str, now_ms: int) -> int:
+    total = len(coverage_samples(now_ms))
+    print(f"Карта наличия данных: {args.base_url}, символ {symbol}, запросов: {total}")
+    print(f"Локальное время сейчас: {format_ts(now_ms)} (по часам этой машины)")
+    print("Идёт опрос (около двух минут), суточные окна по дням месяца...\n")
+    with BingXPublicClient(args.base_url) as client:
+        cells = run_coverage_probe(client, symbol, now_ms, sleep=time.sleep)
+    for line in render_coverage(cells):
+        print(line)
+    print("\nВыводы по этим запросам:")
+    for line in derive_coverage_findings(cells, now_ms):
+        print(f"  - {line}")
+    failed = [c for c in cells if c.got is None]
+    return EXIT_FAILURE if cells and len(failed) == len(cells) else EXIT_OK
 
 
 def cmd_data_download(args: argparse.Namespace) -> int:

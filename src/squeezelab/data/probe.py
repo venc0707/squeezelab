@@ -582,9 +582,167 @@ def derive_depth_findings(results: list[DepthResult], now_ms: int) -> list[str]:
     if native and "15m" in firsts:
         parts = [f"{i}: {(firsts[i] - firsts['15m']) / _DAY_MS:+.1f}" for i in native]
         out.append("начало нативных ТФ относительно 15m, суток: " + "; ".join(parts))
+    if firsts:
+        out.append(
+            "ОГОВОРКА: бисекция считает ряд свечей сплошным; если у биржи есть пропуски, начало "
+            "могло быть найдено неверно (завышено). Сверьте с `--set coverage`"
+        )
     caps = [f"{r.interval}: {r.newest_count}" for r in results if r.newest_count is not None]
     if caps:
         out.append(
             "без времён, limit=1440 (предел ответа, если истории хватает): " + "; ".join(caps)
         )
+    return out
+
+
+# -------------------------------------------- набор coverage: карта наличия данных по месяцам
+
+COVERAGE_FIRST_MONTH = (2022, 1)
+# Какие дни месяца пробуем (по одному суточному окну на день): для 15m и 1m два, для остальных один.
+COVERAGE_DAYS: dict[str, tuple[int, ...]] = {
+    "15m": (1, 15),
+    "1m": (1, 15),
+    "1h": (1,),
+    "4h": (1,),
+    "1d": (1,),
+}
+EXTRA_COVERAGE_DAYS = (datetime(2026, 6, 25, tzinfo=UTC),)  # начало периода по умолчанию
+_FULL_SHARE = 0.95  # доля свечей в суточном окне, с которой день считается покрытым
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageCell:
+    interval: str
+    day_ms: int  # начало суточного окна, UTC
+    got: int | None  # None = запрос не удался
+    expected: int
+
+
+def expected_bars(interval: str) -> int:
+    return _DAY_MS // tf_to_ms(interval)
+
+
+def coverage_samples(now_ms: int) -> list[tuple[str, int]]:
+    """(ТФ, начало суток) для всех месяцев с 2022-01 до последних полных суток."""
+    samples: list[tuple[str, int]] = []
+    year, month = COVERAGE_FIRST_MONTH
+    last_day = now_ms - now_ms % _DAY_MS  # начало текущих суток: они ещё не закончились
+    while True:
+        for interval, days in COVERAGE_DAYS.items():
+            for day in days:
+                start = to_ms(datetime(year, month, day, tzinfo=UTC))
+                if start + _DAY_MS <= last_day:
+                    samples.append((interval, start))
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+        if to_ms(datetime(year, month, 1, tzinfo=UTC)) >= last_day:
+            break
+    for interval in ("15m", "1m"):
+        for moment in EXTRA_COVERAGE_DAYS:
+            if to_ms(moment) + _DAY_MS <= last_day:
+                samples.append((interval, to_ms(moment)))
+    return samples
+
+
+def run_coverage_probe(
+    client: BingXPublicClient,
+    symbol: str,
+    now_ms: int,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[CoverageCell]:
+    """Для каждого дня-образца просит суточное окно `[день, день+сутки)` и считает свечи."""
+    cells: list[CoverageCell] = []
+    for index, (interval, day) in enumerate(coverage_samples(now_ms)):
+        if index:
+            sleep(PAUSE_S)
+        expected = expected_bars(interval)
+        try:
+            candles = client.fetch_klines(
+                symbol, interval, min(expected, MAX_LIMIT), start_time=day, end_time=day + _DAY_MS
+            ).candles
+        except BingXError:
+            cells.append(CoverageCell(interval, day, None, expected))
+            continue
+        inside = sum(1 for c in candles if day <= c.ts_open < day + _DAY_MS)
+        cells.append(CoverageCell(interval, day, inside, expected))
+    return cells
+
+
+def _cell_text(cell: CoverageCell | None) -> str:
+    if cell is None:
+        return "-"
+    return "ошибка" if cell.got is None else f"{cell.got}/{cell.expected}"
+
+
+def render_coverage(cells: list[CoverageCell]) -> list[str]:
+    columns = [(i, d) for i, days in COVERAGE_DAYS.items() for d in days]
+    by_key = {(c.interval, c.day_ms): c for c in cells}
+    months = sorted(
+        {datetime.fromtimestamp(c.day_ms / 1000, tz=UTC).strftime("%Y-%m") for c in cells}
+    )
+    header = ["месяц".ljust(8)] + [f"{i} д{d}".rjust(9) for i, d in columns]
+    lines = [" ".join(header)]
+    for month in months:
+        year, mon = (int(x) for x in month.split("-"))
+        row = [month.ljust(8)]
+        for interval, day in columns:
+            key = (interval, to_ms(datetime(year, mon, day, tzinfo=UTC)))
+            row.append(_cell_text(by_key.get(key)).rjust(9))
+        lines.append(" ".join(row))
+    extra = [c for c in cells if any(c.day_ms == to_ms(m) for m in EXTRA_COVERAGE_DAYS)]
+    for cell in sorted(extra, key=lambda c: (c.interval, c.day_ms)):
+        lines.append(
+            f"{_short(cell.day_ms)[:10]} (начало периода по умолчанию) "
+            f"{cell.interval}: {_cell_text(cell)}"
+        )
+    return lines
+
+
+def derive_coverage_findings(cells: list[CoverageCell], now_ms: int) -> list[str]:
+    out: list[str] = []
+    for interval in COVERAGE_DAYS:
+        mine = sorted((c for c in cells if c.interval == interval), key=lambda c: c.day_ms)
+        regular = [c for c in mine if c.got is not None]
+        if not regular:
+            out.append(f"{interval}: нет данных пробы")
+            continue
+        covered = [c for c in regular if c.got is not None and c.got >= _FULL_SHARE * c.expected]
+        with_data = [c for c in regular if c.got]
+        partial = [c for c in with_data if c not in covered]
+        if not with_data:
+            out.append(f"{interval}: свечей нет ни в одном из {len(regular)} дней-образцов")
+            continue
+        first_any = with_data[0]
+        # «Сплошное» покрытие: первый день, начиная с которого все следующие дни покрыты.
+        stable_from = None
+        for index, cell in enumerate(regular):
+            if all(
+                c.got is not None and c.got >= _FULL_SHARE * c.expected for c in regular[index:]
+            ):
+                stable_from = cell
+                break
+        parts = [f"первые свечи в образцах {_short(first_any.day_ms)[:10]}"]
+        if stable_from is not None:
+            days = (now_ms - stable_from.day_ms) / _DAY_MS
+            parts.append(
+                f"сплошное покрытие с {_short(stable_from.day_ms)[:10]} ({days:.0f} суток назад)"
+            )
+        else:
+            parts.append("сплошного покрытия до конца нет")
+        parts.append(f"дней-образцов с данными {len(with_data)} из {len(regular)}")
+        if partial:
+            shown = ", ".join(f"{_short(c.day_ms)[:10]} {c.got}/{c.expected}" for c in partial[:6])
+            parts.append(f"частичных {len(partial)}: {shown}" + (" …" if len(partial) > 6 else ""))
+        gaps = [c for c in regular if not c.got and c.day_ms > first_any.day_ms]
+        if gaps:
+            shown = ", ".join(_short(c.day_ms)[:10] for c in gaps[:6])
+            parts.append(
+                f"пустых ПОСЛЕ первых данных {len(gaps)}: {shown}" + (" …" if len(gaps) > 6 else "")
+            )
+        out.append(f"{interval}: " + "; ".join(parts))
+    errors = [c for c in cells if c.got is None]
+    if errors:
+        out.append(f"запросов с ошибкой: {len(errors)}")
     return out

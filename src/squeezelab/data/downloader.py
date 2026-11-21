@@ -87,6 +87,7 @@ class DownloadReport:
     window_bars: int = WINDOW_BARS
     requested_start_ms: int = 0  # начало, как его запросили (выровнено вверх по сетке ТФ)
     start_clamped: bool = False  # начало сдвинуто на начало истории пары
+    history_conflict_ts: int | None = None  # бисекция дала это начало, но раньше свечи есть
     no_data: bool = False  # у биржи нет свечей в запрошенном периоде
     exchange_newest_ms: int | None = (
         None  # ts_open самой новой свечи в ответе биржи (формирующейся)
@@ -208,12 +209,23 @@ def download_tf(
                 report.no_data = True
                 report.start_ms = report.end_ms = start
                 return report
-            start = max(start, history.first_ts)
-            report.start_ms = start
-            report.start_clamped = start > report.requested_start_ms
-            if end <= start:
-                report.end_ms = start
-                return report
+            if history.first_ts > start:
+                # Проверка окном (его семантика однозначна): бисекция предполагает сплошной ряд,
+                # а при пропусках в данных биржи могла остановиться посреди истории.
+                limiter.wait()
+                earlier = client.fetch_klines(
+                    symbol, tf, 1, start_time=start, end_time=history.first_ts
+                ).candles
+                report.requests += 1
+                if earlier:
+                    report.history_conflict_ts = history.first_ts
+                else:
+                    start = history.first_ts
+                    report.start_ms = start
+                    report.start_clamped = True
+                    if end <= start:
+                        report.end_ms = start
+                        return report
     report.expected = (end - start) // tf_ms
     windows = plan_windows(start, end, tf_ms, window_bars)
     report.windows = len(windows)
@@ -270,6 +282,12 @@ def render_report(report: DownloadReport) -> list[str]:
         f"без изменений {report.stats.unchanged}, файлов записано {report.stats.files_written}",
         f"  в хранилище за период: {report.stored} из {report.expected}",
     ]
+    if report.history_conflict_ts is not None:
+        lines.append(
+            "  ВНИМАНИЕ: поиск по startTime указал начало "
+            f"{format_ts(report.history_conflict_ts)}, но раньше в окне свечи есть; "
+            "период НЕ урезан, загрузка идёт с запрошенного начала"
+        )
     if report.start_clamped:
         lines.append(
             f"  ВНИМАНИЕ: у биржи нет свечей раньше {format_ts(report.start_ms)}; "

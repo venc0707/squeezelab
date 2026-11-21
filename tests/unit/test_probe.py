@@ -16,17 +16,22 @@ from squeezelab.app.cli import main
 from squeezelab.data.bingx_rest import BingXPublicClient
 from squeezelab.data.models import tf_to_ms
 from squeezelab.data.probe import (
+    COVERAGE_DAYS,
     DEFAULT_ANCHOR,
     DEFAULT_VOLUME_BAR,
     DEPTH_INTERVALS,
     ProbeCase,
     build_cases,
     build_paging_cases,
+    coverage_samples,
+    derive_coverage_findings,
     derive_depth_findings,
     derive_findings,
     derive_paging_findings,
+    render_coverage,
     render_depth,
     render_results,
+    run_coverage_probe,
     run_depth_probe,
     run_probe,
     to_ms,
@@ -463,3 +468,105 @@ def test_cli_probe_depth_fails_when_every_request_fails(
     code = main(["bingx-probe-klines", "--set", "depth", "--config-dir", str(REPO_CONFIG)])
     assert code == 1
     assert "ошибка запроса" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------- набор coverage
+
+DAY = 86_400_000
+NOW_FOR_COVERAGE = to_ms(datetime(2026, 11, 21, 17, 38, tzinfo=UTC))
+
+
+def run_coverage(exchange: FakeBingX):  # type: ignore[no-untyped-def]
+    with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
+        return run_coverage_probe(client, "BNB-USDT", exchange.now_ms, sleep=lambda _s: None)
+
+
+def test_coverage_samples_are_full_past_days_and_include_default_start() -> None:
+    samples = coverage_samples(NOW_FOR_COVERAGE)
+    assert (
+        len(samples) == 59 * 7 + 2
+    )  # 59 месяцев (2022-01 … 2026-11), 7 образцов в месяц, 2 добавочных
+    assert all(day + DAY <= NOW_FOR_COVERAGE - NOW_FOR_COVERAGE % DAY for _, day in samples)
+    assert ("15m", to_ms(datetime(2026, 6, 25, tzinfo=UTC))) in samples
+    assert ("1m", to_ms(datetime(2026, 6, 25, tzinfo=UTC))) in samples
+    assert ("1d", to_ms(datetime(2026, 11, 1, tzinfo=UTC))) in samples
+    assert ("15m", to_ms(datetime(2026, 11, 15, tzinfo=UTC))) in samples
+    assert not any(day >= to_ms(datetime(2026, 11, 21, tzinfo=UTC)) for _, day in samples)
+    assert set(COVERAGE_DAYS) == {"15m", "1m", "1h", "4h", "1d"}
+
+
+def test_coverage_samples_skip_days_that_have_not_ended() -> None:
+    now = to_ms(datetime(2026, 11, 15, 12, tzinfo=UTC))  # сутки 15-го ещё идут
+    samples = coverage_samples(now)
+    assert ("15m", to_ms(datetime(2026, 11, 15, tzinfo=UTC))) not in samples
+    assert ("15m", to_ms(datetime(2026, 11, 1, tzinfo=UTC))) in samples
+
+
+def test_coverage_finds_where_data_begins_and_where_it_is_solid() -> None:
+    listing = to_ms(datetime(2025, 3, 9, tzinfo=UTC))
+    exchange = FakeBingX(Behaviour(history_start=listing), now_ms=NOW_FOR_COVERAGE)
+    cells = run_coverage(exchange)
+    text = "\n".join(derive_coverage_findings(cells, exchange.now_ms))
+    assert "15m: первые свечи в образцах 2025-03-15; сплошное покрытие с 2025-03-15" in text
+    assert "1d: первые свечи в образцах 2025-04-01" in text
+    assert "пустых ПОСЛЕ первых данных" not in text
+    by_key = {(c.interval, c.day_ms): c for c in cells}
+    full_day = by_key[("15m", to_ms(datetime(2026, 6, 25, tzinfo=UTC)))]
+    assert (full_day.got, full_day.expected) == (96, 96)
+    one_minute_day = by_key[("1m", to_ms(datetime(2026, 6, 25, tzinfo=UTC)))]
+    assert (one_minute_day.got, one_minute_day.expected) == (1440, 1440)
+    before = by_key[("15m", to_ms(datetime(2025, 3, 1, tzinfo=UTC)))]
+    assert before.got == 0
+
+
+def test_coverage_reports_partial_days_and_gaps_after_first_data() -> None:
+    tf = 900_000
+    partial_day = to_ms(datetime(2025, 6, 1, tzinfo=UTC))
+    empty_day = to_ms(datetime(2025, 7, 15, tzinfo=UTC))
+    holes = {partial_day + i * tf for i in range(10, 96)}  # от суток остаётся 10 свечей
+    holes |= {empty_day + i * tf for i in range(96)}  # сутки целиком пусты
+    exchange = FakeBingX(
+        Behaviour(history_start=to_ms(datetime(2025, 3, 9, tzinfo=UTC)), holes=frozenset(holes)),
+        now_ms=NOW_FOR_COVERAGE,
+    )
+    text = "\n".join(derive_coverage_findings(run_coverage(exchange), exchange.now_ms))
+    assert "частичных 1: 2025-06-01 10/96" in text
+    assert "пустых ПОСЛЕ первых данных 1: 2025-07-15" in text
+    # «сплошное покрытие» начинается только после последнего дефекта
+    assert "сплошное покрытие с 2025-08-01" in text
+
+
+def test_coverage_table_has_one_row_per_month_plus_header_and_extras() -> None:
+    exchange = FakeBingX(
+        Behaviour(history_start=to_ms(datetime(2025, 3, 9, tzinfo=UTC))), now_ms=NOW_FOR_COVERAGE
+    )
+    lines = render_coverage(run_coverage(exchange))
+    assert len(lines) == 1 + 59 + 2
+    assert lines[0].startswith("месяц")
+    assert "2025-03" in lines[1 + 38]  # 2022-01 + 38 месяцев
+    assert "0/96" in lines[1 + 38]
+    assert "96/96" in lines[-3 - 1 + 1] or any("96/96" in line for line in lines[-10:])
+    assert lines[-2].startswith("2026-06-25 (начало периода по умолчанию) 15m: 96/96")
+    assert lines[-1].startswith("2026-06-25 (начало периода по умолчанию) 1m: 1440/1440")
+
+
+def test_cli_probe_coverage_set(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exchange = FakeBingX(Behaviour(history_start=to_ms(datetime(2025, 3, 9, tzinfo=UTC))))
+    _patch_client(monkeypatch, exchange.transport)
+    code = main(["bingx-probe-klines", "--set", "coverage", "--config-dir", str(REPO_CONFIG)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Карта наличия данных" in out
+    assert "месяц" in out
+    assert "15m: первые свечи в образцах 2025-03-15" in out
+
+
+def test_cli_probe_coverage_fails_when_every_request_fails(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_client(monkeypatch, FakeBingX(fail_after=0).transport)
+    code = main(["bingx-probe-klines", "--set", "coverage", "--config-dir", str(REPO_CONFIG)])
+    assert code == 1
+    assert "запросов с ошибкой" in capsys.readouterr().out
