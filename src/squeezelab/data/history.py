@@ -13,12 +13,26 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
-from squeezelab.data.bingx_rest import BingXPublicClient
+from squeezelab.data.bingx_rest import KlinesResponse
 from squeezelab.data.models import tf_to_ms
 
 Reason = Literal["found", "deeper_than_low", "no_data"]
+
+
+class KlinesFetcher(Protocol):
+    """Всё, что нужно поиску от клиента: `BingXPublicClient` или обёртка с повторами."""
+
+    def fetch_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = ...,
+        *,
+        start_time: int | None = ...,
+        end_time: int | None = ...,
+    ) -> KlinesResponse: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +52,7 @@ def _align_down(value_ms: int, step_ms: int) -> int:
 
 
 def find_history_start(
-    client: BingXPublicClient,
+    client: KlinesFetcher,
     symbol: str,
     interval: str,
     low_ms: int,

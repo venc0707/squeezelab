@@ -507,6 +507,7 @@ def cmd_data_download(args: argparse.Namespace) -> int:
                         limiter=limiter,
                         progress=print,
                         window_bars=window_bars,
+                        sleep=time.sleep,
                     )
                 except (BingXError, StoreError) as exc:
                     print(

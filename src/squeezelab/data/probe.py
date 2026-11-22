@@ -608,6 +608,8 @@ COVERAGE_DAYS: dict[str, tuple[int, ...]] = {
 }
 EXTRA_COVERAGE_DAYS = (datetime(2026, 6, 25, tzinfo=UTC),)  # начало периода по умолчанию
 _FULL_SHARE = 0.95  # доля свечей в суточном окне, с которой день считается покрытым
+COVERAGE_ATTEMPTS = 2  # одна повторная попытка после ошибки
+COVERAGE_RETRY_PAUSE_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +618,7 @@ class CoverageCell:
     day_ms: int  # начало суточного окна, UTC
     got: int | None  # None = запрос не удался
     expected: int
+    error: str | None = None  # причина, если запрос не удался даже после повтора
 
 
 def expected_bars(interval: str) -> int:
@@ -658,12 +661,24 @@ def run_coverage_probe(
         if index:
             sleep(PAUSE_S)
         expected = expected_bars(interval)
-        try:
-            candles = client.fetch_klines(
-                symbol, interval, min(expected, MAX_LIMIT), start_time=day, end_time=day + _DAY_MS
-            ).candles
-        except BingXError:
-            cells.append(CoverageCell(interval, day, None, expected))
+        candles: list[Candle] | None = None
+        error = ""
+        for attempt in range(COVERAGE_ATTEMPTS):
+            if attempt:
+                sleep(COVERAGE_RETRY_PAUSE_S)
+            try:
+                candles = client.fetch_klines(
+                    symbol,
+                    interval,
+                    min(expected, MAX_LIMIT),
+                    start_time=day,
+                    end_time=day + _DAY_MS,
+                ).candles
+                break
+            except BingXError as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        if candles is None:
+            cells.append(CoverageCell(interval, day, None, expected, error))
             continue
         inside = sum(1 for c in candles if day <= c.ts_open < day + _DAY_MS)
         cells.append(CoverageCell(interval, day, inside, expected))
@@ -744,5 +759,11 @@ def derive_coverage_findings(cells: list[CoverageCell], now_ms: int) -> list[str
         out.append(f"{interval}: " + "; ".join(parts))
     errors = [c for c in cells if c.got is None]
     if errors:
-        out.append(f"запросов с ошибкой: {len(errors)}")
+        kinds: dict[str, int] = {}
+        for cell in errors:
+            kinds[cell.error or "причина не сохранена"] = (
+                kinds.get(cell.error or "причина не сохранена", 0) + 1
+            )
+        details = "; ".join(f"{text} ×{n}" for text, n in sorted(kinds.items()))
+        out.append(f"запросов с ошибкой после повтора: {len(errors)} ({details})")
     return out

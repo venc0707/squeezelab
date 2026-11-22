@@ -66,6 +66,7 @@ class FakeBingX:
     behaviour: Behaviour = field(default_factory=Behaviour)
     now_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     fail_after: int | None = None  # после стольких успешных запросов отвечать ошибкой биржи
+    fail_requests: frozenset[int] = frozenset()  # номера запросов (с 1), которые разово падают
     requests: list[dict[str, int | str]] = field(default_factory=list)
 
     @property
@@ -86,6 +87,8 @@ class FakeBingX:
         self.requests.append(
             {k: (int(v) if v.lstrip("-").isdigit() else v) for k, v in params.items()}
         )
+        if len(self.requests) in self.fail_requests:
+            return httpx.Response(200, json={"code": 100410, "msg": "rate limit (fake)"})
         if self.fail_after is not None and len(self.requests) > self.fail_after:
             return httpx.Response(200, json={"code": 100500, "msg": "internal error (fake)"})
         tf_ms = tf_to_ms(params["interval"])

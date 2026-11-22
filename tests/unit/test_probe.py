@@ -550,6 +550,35 @@ def test_coverage_table_has_one_row_per_month_plus_header_and_extras() -> None:
     assert lines[-1].startswith("2026-06-25 (начало периода по умолчанию) 1m: 1440/1440")
 
 
+def test_coverage_retries_a_failed_request_once() -> None:
+    exchange = FakeBingX(
+        Behaviour(history_start=to_ms(datetime(2025, 3, 9, tzinfo=UTC))),
+        now_ms=NOW_FOR_COVERAGE,
+        fail_requests=frozenset({5, 40}),
+    )
+    pauses: list[float] = []
+    with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
+        cells = run_coverage_probe(client, "BNB-USDT", exchange.now_ms, sleep=pauses.append)
+    assert all(c.got is not None for c in cells)  # единичные сбои исправлены повтором
+    assert pauses.count(2.0) == 2
+
+
+def test_coverage_keeps_the_error_text_when_retry_fails_too() -> None:
+    exchange = FakeBingX(
+        Behaviour(history_start=to_ms(datetime(2025, 3, 9, tzinfo=UTC))),
+        now_ms=NOW_FOR_COVERAGE,
+        fail_requests=frozenset({7, 8}),  # запрос и его повтор
+    )
+    cells = run_coverage(exchange)
+    failed = [c for c in cells if c.got is None]
+    assert len(failed) == 1
+    assert failed[0].error is not None
+    assert "BingXAPIError" in failed[0].error
+    text = "\n".join(derive_coverage_findings(cells, exchange.now_ms))
+    assert "запросов с ошибкой после повтора: 1 (BingXAPIError" in text
+    assert "rate limit (fake)" in text
+
+
 def test_cli_probe_coverage_set(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -21,6 +21,10 @@
 отдаёт биржа (она формирующаяся). Берётся более строгая граница, поэтому сбитые часы не дадут
 записать недозакрытую свечу.
 
+Временные сбои (сеть, ответ с ошибкой биржи, неразобранный ответ) не обрывают загрузку: каждый
+запрос повторяется до трёх раз с паузами 2, 5 и 10 секунд, затем ошибка пробрасывается, а
+накопленное остаётся на диске.
+
 Пропуски, которых у биржи нет, здесь только фиксируются в отчёте после нескольких попыток.
 Пометку «подтверждённо отсутствует» и команды проверки добавляет P01-T03.
 """
@@ -32,8 +36,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from squeezelab.data.bingx_rest import BingXPublicClient
-from squeezelab.data.history import find_history_start
+from squeezelab.data.bingx_rest import BingXError, BingXPublicClient, KlinesResponse
+from squeezelab.data.history import KlinesFetcher, find_history_start
 from squeezelab.data.models import Candle, format_ts, is_candle_closed, tf_to_ms
 from squeezelab.data.store import CandleStore, WriteStats
 
@@ -42,6 +46,7 @@ WINDOW_ATTEMPTS = 3  # попыток на окно, если в ответе н
 FLUSH_EVERY_WINDOWS = 10  # как часто сбрасывать накопленное на диск
 MAX_REQUESTS_PER_SECOND = 5.0  # требование задания; лимит биржи 500 за 10 с
 DEFAULT_START = datetime(2026, 6, 25, tzinfo=UTC)  # прогрев 500 баров до 2026-07-01
+RETRY_DELAYS_S = (2.0, 5.0, 10.0)  # паузы перед повторами запроса после ошибки
 _MISSING_PREVIEW = 10
 
 
@@ -85,6 +90,8 @@ class DownloadReport:
     dropped_unclosed: int = 0
     dropped_out_of_range: int = 0
     window_bars: int = WINDOW_BARS
+    retries: int = 0  # повторов запросов после временных ошибок
+    last_retry_error: str = ""
     requested_start_ms: int = 0  # начало, как его запросили (выровнено вверх по сетке ТФ)
     start_clamped: bool = False  # начало сдвинуто на начало истории пары
     history_conflict_ts: int | None = None  # бисекция дала это начало, но раньше свечи есть
@@ -125,8 +132,44 @@ def plan_windows(
     return windows
 
 
+class _RetryingClient:
+    """Повторяет `fetch_klines` после ошибок биржи и считает повторы в отчёте."""
+
+    def __init__(
+        self,
+        client: BingXPublicClient,
+        sleep: Callable[[float], None],
+        report: DownloadReport,
+    ) -> None:
+        self._client = client
+        self._sleep = sleep
+        self._report = report
+
+    def fetch_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 20,
+        *,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> KlinesResponse:
+        for delay in (*RETRY_DELAYS_S, None):
+            try:
+                return self._client.fetch_klines(
+                    symbol, interval, limit, start_time=start_time, end_time=end_time
+                )
+            except BingXError as exc:
+                if delay is None:
+                    raise
+                self._report.retries += 1
+                self._report.last_retry_error = f"{type(exc).__name__}: {exc}"
+                self._sleep(delay)
+        raise AssertionError("недостижимо")  # pragma: no cover
+
+
 def _fetch_window(
-    client: BingXPublicClient,
+    client: KlinesFetcher,
     symbol: str,
     tf: str,
     tf_ms: int,
@@ -167,6 +210,7 @@ def download_tf(
     limiter: RateLimiter,
     progress: Callable[[str], None] | None = None,
     window_bars: int = WINDOW_BARS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> DownloadReport:
     """Докачивает свечи `[start_ms, end_ms)` одной пары и одного ТФ.
 
@@ -183,9 +227,10 @@ def download_tf(
     )
     if end <= start:
         return report
+    fetcher = _RetryingClient(client, sleep, report)
     # Граница по бирже: самая новая свеча в выдаче формирующаяся, закрытые лежат строго раньше.
     limiter.wait()
-    newest = client.fetch_klines(symbol, tf, 1).candles
+    newest = fetcher.fetch_klines(symbol, tf, 1).candles
     report.requests += 1
     if newest:
         report.exchange_newest_ms = max(candle.ts_open for candle in newest)
@@ -200,10 +245,10 @@ def download_tf(
     if start not in existing:
         # Есть ли у биржи свечи не раньше start? Если нет, start раньше начала истории.
         limiter.wait()
-        probe = client.fetch_klines(symbol, tf, 1, start_time=start).candles
+        probe = fetcher.fetch_klines(symbol, tf, 1, start_time=start).candles
         report.requests += 1
         if not probe:
-            history = find_history_start(client, symbol, tf, start, end - tf_ms, wait=limiter.wait)
+            history = find_history_start(fetcher, symbol, tf, start, end - tf_ms, wait=limiter.wait)
             report.requests += history.requests
             if history.first_ts is None:
                 report.no_data = True
@@ -213,7 +258,7 @@ def download_tf(
                 # Проверка окном (его семантика однозначна): бисекция предполагает сплошной ряд,
                 # а при пропусках в данных биржи могла остановиться посреди истории.
                 limiter.wait()
-                earlier = client.fetch_klines(
+                earlier = fetcher.fetch_klines(
                     symbol, tf, 1, start_time=start, end_time=history.first_ts
                 ).candles
                 report.requests += 1
@@ -246,7 +291,7 @@ def download_tf(
                 report.windows_skipped += 1
                 continue
             got = _fetch_window(
-                client, symbol, tf, tf_ms, window, now_ms, limiter, report, window_bars
+                fetcher, symbol, tf, tf_ms, window, now_ms, limiter, report, window_bars
             )
             pending.extend(got.values())
             report.accepted += len(got)
@@ -282,6 +327,11 @@ def render_report(report: DownloadReport) -> list[str]:
         f"без изменений {report.stats.unchanged}, файлов записано {report.stats.files_written}",
         f"  в хранилище за период: {report.stored} из {report.expected}",
     ]
+    if report.retries:
+        lines.append(
+            f"  повторов запросов после временных ошибок: {report.retries} "
+            f"(последняя ошибка: {report.last_retry_error})"
+        )
     if report.history_conflict_ts is not None:
         lines.append(
             "  ВНИМАНИЕ: поиск по startTime указал начало "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
@@ -57,6 +58,7 @@ def run_download(
     *,
     now_ms: int | None = None,
     window_bars: int = WINDOW_BARS,
+    sleeps: list[float] | None = None,
 ) -> DownloadReport:
     with BingXPublicClient(transport=exchange.transport, sleep=lambda _s: None) as client:
         return download_tf(
@@ -69,6 +71,7 @@ def run_download(
             now_ms=now_ms if now_ms is not None else exchange.now_ms,
             limiter=fast_limiter(),
             window_bars=window_bars,
+            sleep=sleeps.append if sleeps is not None else (lambda _s: None),
         )
 
 
@@ -406,6 +409,59 @@ def test_clamp_is_refused_when_window_check_finds_earlier_candles(
     assert any("период НЕ урезан" in line for line in render_report(report))
 
 
+# ----------------------------------------------------------------- временные ошибки
+
+
+def test_transient_error_in_a_window_is_retried(store: CandleStore) -> None:
+    exchange = FakeBingX(now_ms=NOW, fail_requests=frozenset({3}))  # 1 граница, 2 старт, 3 окно
+    sleeps: list[float] = []
+    report = run_download(exchange, store, sleeps=sleeps)
+    assert report.retries == 1
+    assert "rate limit" in report.last_retry_error
+    assert "BingXAPIError" in report.last_retry_error
+    assert sleeps == [2.0]
+    assert report.missing == []
+    assert_matches_exchange(store, "15m", START, FORMING_15M)
+    assert any("повторов запросов после временных ошибок: 1" in x for x in render_report(report))
+
+
+def test_transient_errors_in_service_requests_are_retried_too(store: CandleStore) -> None:
+    exchange = FakeBingX(now_ms=NOW, fail_requests=frozenset({1, 3}))  # граница и проверка начала
+    sleeps: list[float] = []
+    report = run_download(exchange, store, sleeps=sleeps)
+    assert report.retries == 2
+    assert report.missing == []
+
+
+def test_retry_delays_grow_and_then_the_error_is_raised(store: CandleStore) -> None:
+    exchange = FakeBingX(now_ms=NOW, fail_after=0)
+    sleeps: list[float] = []
+    with pytest.raises(BingXError):
+        run_download(exchange, store, sleeps=sleeps)
+    assert sleeps == [2.0, 5.0, 10.0]
+    assert len(exchange.requests) == 4  # первый запрос и три повтора
+
+
+def test_progress_survives_when_retries_are_exhausted(store: CandleStore) -> None:
+    start, end = ms(2026, 11, 17), ms(2026, 11, 19, 12)  # 1m, четыре окна
+    exchange = FakeBingX(now_ms=NOW, fail_after=4)
+    sleeps: list[float] = []
+    with pytest.raises(BingXError):
+        run_download(exchange, store, "1m", start, end, sleeps=sleeps)
+    assert sleeps == [2.0, 5.0, 10.0]
+    assert store.timestamps(SYMBOL, "1m") == set(range(start, start + 2000 * 60_000, 60_000))
+
+
+def test_cli_retries_transient_errors_and_reports_them(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_cli(monkeypatch, FakeBingX(fail_requests=frozenset({3})), tmp_path)
+    assert main(ARGS) == 0
+    out = capsys.readouterr().out
+    assert "повторов запросов после временных ошибок: 1" in out
+    assert "пропусков нет" in out
+
+
 # ----------------------------------------------------------------------- сбой API
 
 
@@ -453,6 +509,7 @@ def _patch_cli(monkeypatch: pytest.MonkeyPatch, exchange: FakeBingX, tmp_path: P
 
     monkeypatch.setattr(BingXPublicClient, "__init__", patched)
     monkeypatch.setattr("squeezelab.app.cli.RateLimiter", fast_limiter)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)  # паузы повторов после ошибок
     monkeypatch.setenv("SQUEEZELAB_DATA_DIR", str(tmp_path / "data"))
 
 
