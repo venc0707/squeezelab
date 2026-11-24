@@ -21,6 +21,10 @@
 отдаёт биржа (она формирующаяся). Берётся более строгая граница, поэтому сбитые часы не дадут
 записать недозакрытую свечу.
 
+Пропуски, оставшиеся после основного прохода, докачиваются узкими окнами (`data/sync.py`); те, что
+биржа так и не отдала, помечаются «подтверждённо отсутствуют» и больше не запрашиваются: окно, в
+котором есть только такие слоты, считается полным.
+
 Временные сбои (сеть, ответ с ошибкой биржи, неразобранный ответ) не обрывают загрузку: каждый
 запрос повторяется до трёх раз с паузами 2, 5 и 10 секунд, затем ошибка пробрасывается, а
 накопленное остаётся на диске.
@@ -35,11 +39,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Protocol
 
 from squeezelab.data.bingx_rest import BingXError, BingXPublicClient, KlinesResponse
 from squeezelab.data.history import KlinesFetcher, find_history_start
 from squeezelab.data.models import Candle, format_ts, is_candle_closed, tf_to_ms
 from squeezelab.data.store import CandleStore, WriteStats
+from squeezelab.data.sync import SyncReport, sync_gaps
 
 WINDOW_BARS = 1000  # не больше наблюдаемого предела ответа биржи
 WINDOW_ATTEMPTS = 3  # попыток на окно, если в ответе не хватает свечей
@@ -102,7 +108,9 @@ class DownloadReport:
     end_cut_by_exchange: bool = False  # конец периода урезан по свече биржи (часы машины спешат)
     stored: int = 0  # свечей периода в хранилище после загрузки
     stats: WriteStats = field(default_factory=WriteStats)
-    missing: list[int] = field(default_factory=list)  # ts_open, которых нет нигде
+    missing: list[int] = field(default_factory=list)  # ts_open, которых нет и не подтверждено
+    confirmed_missing: list[int] = field(default_factory=list)  # подтверждённо отсутствуют у биржи
+    sync: SyncReport | None = None  # итог докачки пропусков (если она понадобилась)
 
 
 def align_up(value_ms: int, step_ms: int) -> int:
@@ -132,14 +140,29 @@ def plan_windows(
     return windows
 
 
-class _RetryingClient:
+class RetryCounter(Protocol):
+    """Куда `RetryingClient` записывает повторы (отчёт загрузки или докачки)."""
+
+    retries: int
+    last_retry_error: str
+
+
+@dataclass
+class RetryTally:
+    """Простейший счётчик повторов для вызовов вне загрузчика (например, `data sync`)."""
+
+    retries: int = 0
+    last_retry_error: str = ""
+
+
+class RetryingClient:
     """Повторяет `fetch_klines` после ошибок биржи и считает повторы в отчёте."""
 
     def __init__(
         self,
         client: BingXPublicClient,
         sleep: Callable[[float], None],
-        report: DownloadReport,
+        report: RetryCounter,
     ) -> None:
         self._client = client
         self._sleep = sleep
@@ -227,7 +250,7 @@ def download_tf(
     )
     if end <= start:
         return report
-    fetcher = _RetryingClient(client, sleep, report)
+    fetcher = RetryingClient(client, sleep, report)
     # Граница по бирже: самая новая свеча в выдаче формирующаяся, закрытые лежат строго раньше.
     limiter.wait()
     newest = fetcher.fetch_klines(symbol, tf, 1).candles
@@ -272,6 +295,7 @@ def download_tf(
                         report.end_ms = start
                         return report
     report.expected = (end - start) // tf_ms
+    confirmed = set(store.confirmed_missing(symbol, tf))
     windows = plan_windows(start, end, tf_ms, window_bars)
     report.windows = len(windows)
 
@@ -287,7 +311,7 @@ def download_tf(
     try:
         for index, window in enumerate(windows, start=1):
             expected = range(window[0], window[1], tf_ms)
-            if all(ts in existing for ts in expected):
+            if all(ts in existing or ts in confirmed for ts in expected):
                 report.windows_skipped += 1
                 continue
             got = _fetch_window(
@@ -295,7 +319,11 @@ def download_tf(
             )
             pending.extend(got.values())
             report.accepted += len(got)
-            report.missing.extend(ts for ts in expected if ts not in got and ts not in existing)
+            report.missing.extend(
+                ts
+                for ts in expected
+                if ts not in got and ts not in existing and ts not in confirmed
+            )
             since_flush += 1
             if since_flush >= FLUSH_EVERY_WINDOWS:
                 flush()
@@ -305,7 +333,41 @@ def download_tf(
     finally:
         flush()
         report.stored = sum(1 for ts in existing if start <= ts < end)
+    if report.missing:
+        _close_gaps(fetcher, store, symbol, tf, start, end, now_ms, limiter, sleep, report)
+    else:
+        report.confirmed_missing = sorted(
+            ts for ts in confirmed if start <= ts < end and ts not in existing
+        )
     return report
+
+
+def _close_gaps(
+    fetcher: KlinesFetcher,
+    store: CandleStore,
+    symbol: str,
+    tf: str,
+    start: int,
+    end: int,
+    now_ms: int,
+    limiter: RateLimiter,
+    sleep: Callable[[float], None],
+    report: DownloadReport,
+) -> None:
+    """Докачка пропусков после основного прохода и пересчёт итога периода."""
+    tf_ms = tf_to_ms(tf)
+    sync = sync_gaps(
+        fetcher, store, symbol, tf, start, end, now_ms=now_ms, limiter=limiter, sleep=sleep
+    )
+    report.sync = sync
+    report.requests += sync.requests
+    report.stats += sync.stats
+    have = store.timestamps(symbol, tf)
+    confirmed = set(store.confirmed_missing(symbol, tf))
+    absent = [ts for ts in range(start, end, tf_ms) if ts not in have]
+    report.missing = [ts for ts in absent if ts not in confirmed]
+    report.confirmed_missing = [ts for ts in absent if ts in confirmed]
+    report.stored = sum(1 for ts in have if start <= ts < end)
 
 
 def render_report(report: DownloadReport) -> list[str]:
@@ -348,11 +410,26 @@ def render_report(report: DownloadReport) -> list[str]:
             "  ВНИМАНИЕ: конец периода урезан по свече биржи "
             f"({format_ts(report.exchange_newest_ms)}): часы этой машины спешат относительно биржи"
         )
+    if report.sync is not None:
+        sync = report.sync
+        lines.append(
+            f"  докачка пропусков: найдено {sync.gaps_found}, докачано {sync.filled}, "
+            f"подтверждённо отсутствуют {sync.confirmed_new}, ждут подтверждения "
+            f"{len(sync.pending)}, запросов {sync.requests}"
+        )
+    if report.confirmed_missing:
+        lines.append(
+            f"  ВНИМАНИЕ: ПОДТВЕРЖДЁННО ОТСУТСТВУЮТ у биржи ({len(report.confirmed_missing)}): "
+            + _preview(report.confirmed_missing)
+        )
     if report.missing:
-        shown = ", ".join(format_ts(ts) for ts in report.missing[:_MISSING_PREVIEW])
-        more = len(report.missing) - _MISSING_PREVIEW
-        suffix = f" … и ещё {more}" if more > 0 else ""
-        lines.append(f"  ПРОПУСКИ ({len(report.missing)}): {shown}{suffix}")
-    else:
+        lines.append(f"  ПРОПУСКИ ({len(report.missing)}): {_preview(report.missing)}")
+    elif not report.confirmed_missing:
         lines.append("  пропусков нет")
     return lines
+
+
+def _preview(timestamps: list[int]) -> str:
+    shown = ", ".join(format_ts(ts) for ts in timestamps[:_MISSING_PREVIEW])
+    more = len(timestamps) - _MISSING_PREVIEW
+    return shown + (f" … и ещё {more}" if more > 0 else "")

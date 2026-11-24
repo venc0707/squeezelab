@@ -11,14 +11,19 @@
   не трогает файл (не меняется даже время изменения);
 - если биржа прислала для уже сохранённого `ts_open` другие значения, побеждают новые, а в
   статистике записи это видно как `updated`;
-- данные автоматически не удаляются (правило 4 задания).
+- данные автоматически не удаляются (правило 4 задания);
+- рядом с файлами месяцев лежит реестр `confirmed_missing.json`: свечи, которых у биржи нет
+  (P01-T03). Реестр не данные, а пометка, чтобы пропуск не запрашивали бесконечно; когда свеча
+  всё же появляется в хранилище, запись о ней из реестра убирается сама.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +31,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from squeezelab.data.models import Candle
+from squeezelab.data.models import Candle, tf_to_ms
 
 SCHEMA = pa.schema(
     [
@@ -66,6 +71,25 @@ class WriteStats:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RawFile:
+    """Файл месяца «как лежит»: строки в порядке файла, без слияния и дедупликации."""
+
+    path: Path
+    month: tuple[int, int]  # из имени файла
+    rows: list[Candle]
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedMissing:
+    ts_open: int
+    attempts: int  # сколько попыток докачки сделано до подтверждения
+    confirmed_at_ms: int
+
+
+CONFIRMED_FILE = "confirmed_missing.json"
+
+
 def month_of(ts_ms: int) -> tuple[int, int]:
     moment = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
     return moment.year, moment.month
@@ -98,7 +122,39 @@ class CandleStore:
             return []
         return sorted(p for p in directory.iterdir() if _MONTH_FILE_RE.match(p.name))
 
+    def confirmed_path(self, symbol: str, tf: str) -> Path:
+        return self.tf_dir(symbol, tf) / CONFIRMED_FILE
+
+    def symbols(self) -> list[str]:
+        """Пары, для которых есть каталог со свечами."""
+        base = self.root / "candles"
+        if not base.is_dir():
+            return []
+        return sorted(p.name for p in base.iterdir() if p.is_dir() and _SYMBOL_RE.match(p.name))
+
+    def timeframes(self, symbol: str) -> list[str]:
+        """Таймфреймы пары, у которых есть файлы свечей, от короткого к длинному."""
+        base = self.root / "candles" / symbol
+        if not _SYMBOL_RE.match(symbol) or not base.is_dir():
+            return []
+        found = [p.name for p in base.iterdir() if p.is_dir() and _TF_RE.match(p.name)]
+        return sorted((tf for tf in found if self.month_files(symbol, tf)), key=tf_to_ms)
+
     # ---------------------------------------------------------------- чтение
+
+    def read_raw(self, symbol: str, tf: str) -> list[RawFile]:
+        """Файлы месяцев «как есть»: для проверки качества (дубли, порядок, чужой месяц)."""
+        files: list[RawFile] = []
+        for path in self.month_files(symbol, tf):
+            match = _MONTH_FILE_RE.match(path.name)
+            if match is None:  # month_files отдаёт только такие имена
+                raise StoreError(f"{path}: имя файла не вида ГГГГ-ММ.parquet")
+            table = self._read_table(path)
+            ts = table.column("ts_open").to_pylist()
+            o, h, lo, c, v = (table.column(n).to_pylist() for n in ("o", "h", "l", "c", "v"))
+            rows = [Candle(ts[i], o[i], h[i], lo[i], c[i], v[i]) for i in range(len(ts))]
+            files.append(RawFile(path, (int(match.group(1)), int(match.group(2))), rows))
+        return files
 
     def _read_rows(self, path: Path) -> dict[int, _Row]:
         table = self._read_table(path)
@@ -153,7 +209,69 @@ class CandleStore:
         total = WriteStats()
         for (year, month), incoming in sorted(by_month.items()):
             total += self._merge_month(self.month_path(symbol, tf, year, month), incoming)
+        if total.added or total.updated:
+            self._forget_confirmed(symbol, tf, (candle.ts_open for candle in candles))
         return total
+
+    # ------------------------------------------------- реестр «подтверждённо отсутствуют»
+
+    def confirmed_missing(self, symbol: str, tf: str) -> dict[int, ConfirmedMissing]:
+        path = self.confirmed_path(symbol, tf)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            items = payload["items"]
+            return {
+                int(i["ts_open"]): ConfirmedMissing(
+                    int(i["ts_open"]), int(i["attempts"]), int(i["confirmed_at_ms"])
+                )
+                for i in items
+            }
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise StoreError(f"{path}: не удалось прочитать реестр пропусков ({exc})") from exc
+
+    def add_confirmed_missing(self, symbol: str, tf: str, items: Iterable[ConfirmedMissing]) -> int:
+        """Добавляет пометки (существующие обновляются). Возвращает число новых."""
+        current = self.confirmed_missing(symbol, tf)
+        new = 0
+        for item in items:
+            new += item.ts_open not in current
+            current[item.ts_open] = item
+        if new or current:
+            self._write_confirmed(symbol, tf, current)
+        return new
+
+    def _forget_confirmed(self, symbol: str, tf: str, present: Iterable[int]) -> None:
+        """Свеча появилась в хранилище: пометка «отсутствует» о ней больше не верна."""
+        if not self.confirmed_path(symbol, tf).exists():
+            return
+        current = self.confirmed_missing(symbol, tf)
+        stale = current.keys() & set(present)
+        if stale:
+            for ts in stale:
+                del current[ts]
+            self._write_confirmed(symbol, tf, current)
+
+    def _write_confirmed(self, symbol: str, tf: str, items: dict[int, ConfirmedMissing]) -> None:
+        path = self.confirmed_path(symbol, tf)
+        payload = {
+            "version": 1,
+            "items": [
+                {"ts_open": i.ts_open, "attempts": i.attempts, "confirmed_at_ms": i.confirmed_at_ms}
+                for i in sorted(items.values(), key=lambda x: x.ts_open)
+            ],
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            with tmp.open("rb+") as handle:
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _merge_month(self, path: Path, incoming: dict[int, _Row]) -> WriteStats:
         existing = self._read_rows(path) if path.exists() else {}

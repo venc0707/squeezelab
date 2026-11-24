@@ -10,7 +10,14 @@ import pyarrow.parquet as pq
 import pytest
 
 from squeezelab.data.models import Candle, is_contiguous
-from squeezelab.data.store import SCHEMA, CandleStore, StoreError, WriteStats
+from squeezelab.data.store import (
+    CONFIRMED_FILE,
+    SCHEMA,
+    CandleStore,
+    ConfirmedMissing,
+    StoreError,
+    WriteStats,
+)
 
 TF = 900_000
 GARBAGE = "это не parquet".encode()
@@ -239,3 +246,102 @@ def test_foreign_schema_raises_store_error(store: CandleStore) -> None:
     pq.write_table(pa.table({"ts_open": pa.array([1], type=pa.int64())}), path)
     with pytest.raises(StoreError, match="схема"):
         store.read("BNB-USDT", "15m")
+
+
+# ------------------------------------------------------ чтение «как лежит» и реестр пропусков
+
+
+def write_raw_month(store: CandleStore, tf: str, year: int, month: int, rows: list[Candle]) -> Path:
+    """Пишет файл месяца напрямую, мимо слияния: так можно получить дубли и беспорядок."""
+    import pyarrow as pa
+
+    path = store.month_path("BNB-USDT", tf, year, month)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.table(
+        {
+            "ts_open": pa.array([r.ts_open for r in rows], type=pa.int64()),
+            "o": pa.array([r.o for r in rows], type=pa.float64()),
+            "h": pa.array([r.h for r in rows], type=pa.float64()),
+            "l": pa.array([r.l for r in rows], type=pa.float64()),
+            "c": pa.array([r.c for r in rows], type=pa.float64()),
+            "v": pa.array([r.v for r in rows], type=pa.float64()),
+        },
+        schema=SCHEMA,
+    )
+    pq.write_table(table, path)
+    return path
+
+
+def test_read_raw_keeps_duplicates_and_order_as_in_the_file(store: CandleStore) -> None:
+    first = ms(2026, 11, 1)
+    rows = [candle(first + TF), candle(first), candle(first), candle(first + 2 * TF)]
+    write_raw_month(store, "15m", 2026, 11, rows)
+    (raw,) = store.read_raw("BNB-USDT", "15m")
+    assert raw.month == (2026, 11)
+    assert [c.ts_open for c in raw.rows] == [first + TF, first, first, first + 2 * TF]
+    assert len(store.read("BNB-USDT", "15m")) == 3  # обычное чтение сливает дубли
+
+
+def test_read_raw_of_missing_data_is_empty(store: CandleStore) -> None:
+    assert store.read_raw("BNB-USDT", "15m") == []
+
+
+def test_symbols_and_timeframes_are_listed_from_disk(store: CandleStore) -> None:
+    store.write("ETH-USDT", "1m", run(ms(2026, 11, 1), 2, 60_000))
+    store.write("BNB-USDT", "1h", run(ms(2026, 11, 1), 2, 3_600_000))
+    store.write("BNB-USDT", "1m", run(ms(2026, 11, 1), 2, 60_000))
+    store.write("BNB-USDT", "15m", run(ms(2026, 11, 1), 2))
+    (store.root / "candles" / "BNB-USDT" / "4h").mkdir()  # пустой каталог не считается
+    (store.root / "candles" / "notes").mkdir()
+    assert store.symbols() == ["BNB-USDT", "ETH-USDT"]
+    assert store.timeframes("BNB-USDT") == ["1m", "15m", "1h"]
+    assert store.timeframes("SOL-USDT") == []
+    assert store.timeframes("bad name") == []
+    assert CandleStore(store.root / "нет").symbols() == []
+
+
+def test_confirmed_missing_roundtrip_and_update(store: CandleStore) -> None:
+    ts = ms(2026, 11, 1, 3)
+    assert store.confirmed_missing("BNB-USDT", "15m") == {}
+    assert store.add_confirmed_missing("BNB-USDT", "15m", [ConfirmedMissing(ts, 3, 111)]) == 1
+    assert store.add_confirmed_missing("BNB-USDT", "15m", [ConfirmedMissing(ts, 6, 222)]) == 0
+    assert store.confirmed_missing("BNB-USDT", "15m") == {ts: ConfirmedMissing(ts, 6, 222)}
+    assert (store.root / "candles" / "BNB-USDT" / "15m" / CONFIRMED_FILE).is_file()
+    assert store.month_files("BNB-USDT", "15m") == []  # реестр не считается файлом свечей
+
+
+def test_writing_a_candle_removes_its_confirmed_missing_mark(store: CandleStore) -> None:
+    hole, other = ms(2026, 11, 1, 3), ms(2026, 11, 1, 4)
+    store.add_confirmed_missing(
+        "BNB-USDT", "15m", [ConfirmedMissing(hole, 3, 1), ConfirmedMissing(other, 3, 1)]
+    )
+    store.write("BNB-USDT", "15m", [candle(hole)])
+    assert set(store.confirmed_missing("BNB-USDT", "15m")) == {other}
+    store.write("BNB-USDT", "15m", [candle(hole)])  # повторная запись ничего не меняет
+    assert set(store.confirmed_missing("BNB-USDT", "15m")) == {other}
+
+
+def test_corrupted_registry_raises_store_error(store: CandleStore) -> None:
+    store.add_confirmed_missing("BNB-USDT", "15m", [ConfirmedMissing(ms(2026, 11, 1), 3, 1)])
+    path = store.confirmed_path("BNB-USDT", "15m")
+    path.write_text("{не json", encoding="utf-8")
+    with pytest.raises(StoreError, match="реестр"):
+        store.confirmed_missing("BNB-USDT", "15m")
+
+
+def test_failed_registry_write_keeps_the_old_registry(
+    store: CandleStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ts = ms(2026, 11, 1)
+    store.add_confirmed_missing("BNB-USDT", "15m", [ConfirmedMissing(ts, 3, 1)])
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("нет места")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="нет места"):
+        store.add_confirmed_missing("BNB-USDT", "15m", [ConfirmedMissing(ts + TF, 3, 1)])
+    monkeypatch.undo()
+    assert set(store.confirmed_missing("BNB-USDT", "15m")) == {ts}
+    directory = store.confirmed_path("BNB-USDT", "15m").parent
+    assert not [p for p in directory.iterdir() if ".tmp" in p.name]

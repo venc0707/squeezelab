@@ -280,18 +280,35 @@ def test_slow_local_clock_is_respected(store: CandleStore) -> None:
 # ---------------------------------------------------------------- странности биржи
 
 
-def test_exchange_holes_are_reported_and_do_not_loop_forever(store: CandleStore) -> None:
+def test_exchange_holes_are_confirmed_missing_and_never_requested_again(
+    store: CandleStore,
+) -> None:
     holes = frozenset({START + 3 * 900_000, START + 7 * 900_000})
     exchange = FakeBingX(Behaviour(holes=holes), now_ms=NOW)
     report = run_download(exchange, store)
-    assert report.missing == sorted(holes)
+    assert report.missing == []  # неподтверждённых пропусков нет
+    assert report.confirmed_missing == sorted(holes)
     assert report.stored == report.expected - 2
-    # окно с дырами запрашивалось ограниченное число раз (3 попытки), остальные по разу
+    assert report.sync is not None
+    assert (report.sync.gaps_found, report.sync.filled, report.sync.confirmed_new) == (2, 0, 2)
+    assert set(store.confirmed_missing(SYMBOL, "15m")) == holes
+    # окно с дырами запрошено 3 раза (попытки), дальше две группы пропусков по 3 попытки докачки
     attempts = [int(r["startTime"]) for r in exchange.data_requests()]
     assert attempts.count(START) == 3
-    again = run_download(FakeBingX(Behaviour(holes=holes), now_ms=NOW), store)
-    assert again.missing == sorted(holes)
-    assert any("ПРОПУСКИ (2)" in line for line in render_report(report))
+    assert attempts.count(START + 3 * 900_000) == 3
+    assert attempts.count(START + 7 * 900_000) == 3
+    text = "\n".join(render_report(report))
+    assert "ПОДТВЕРЖДЁННО ОТСУТСТВУЮТ у биржи (2)" in text
+    assert "докачка пропусков: найдено 2, докачано 0, подтверждённо отсутствуют 2" in text
+    assert "пропусков нет" not in text
+
+    again_exchange = FakeBingX(Behaviour(holes=holes), now_ms=NOW)
+    again = run_download(again_exchange, store)
+    assert again.windows_skipped == again.windows  # окно с подтверждёнными дырами считается полным
+    assert again.requests == 1  # только граница по бирже
+    assert again.confirmed_missing == sorted(holes)
+    assert again.missing == []
+    assert again_exchange.data_requests() == []
 
 
 def test_offgrid_candles_are_dropped_and_counted(store: CandleStore) -> None:
@@ -301,12 +318,16 @@ def test_offgrid_candles_are_dropped_and_counted(store: CandleStore) -> None:
     assert store.timestamps(SYMBOL, "15m") == {START + i * 900_000 for i in range(4)}
 
 
-def test_smaller_exchange_cap_is_visible_not_silent(store: CandleStore) -> None:
-    """Если предел ответа окажется меньше окна, это видно как пропуски, а не как «всё хорошо»."""
+def test_gap_sync_recovers_what_a_smaller_cap_truncated(store: CandleStore) -> None:
+    """Окно в 1000 при пределе 300 усекается, но докачка узкими окнами (100) добирает остальное."""
     exchange = FakeBingX(Behaviour(cap=300), now_ms=NOW)
     report = run_download(exchange, store, "15m", LONG_START, LONG_START + 1000 * 900_000)
-    assert len(report.missing) == 700
-    assert report.stored == 300
+    assert report.missing == []
+    assert report.confirmed_missing == []
+    assert report.stored == report.expected
+    assert report.sync is not None
+    assert report.sync.filled == 700
+    assert_matches_exchange(store, "15m", LONG_START, LONG_START + 1000 * 900_000)
 
 
 def test_window_size_can_follow_a_smaller_cap(store: CandleStore) -> None:
@@ -404,7 +425,8 @@ def test_clamp_is_refused_when_window_check_finds_earlier_candles(
     assert report.history_conflict_ts == START + 10 * 900_000
     assert not report.start_clamped
     assert report.start_ms == START
-    assert report.missing == [START]  # единственная настоящая дыра
+    assert report.missing == []
+    assert report.confirmed_missing == [START]  # единственная настоящая дыра
     assert report.stored == report.expected - 1
     assert any("период НЕ урезан" in line for line in render_report(report))
 
@@ -569,8 +591,9 @@ def test_cli_reports_gaps_and_still_exits_zero(
     _patch_cli(monkeypatch, FakeBingX(Behaviour(holes=frozenset({hole}))), tmp_path)
     assert main(ARGS) == 0
     out = capsys.readouterr().out
-    assert "ПРОПУСКИ (1): 2026-11-17 03:00:00 UTC" in out
-    assert "ПРЕДУПРЕЖДЕНИЕ: пропусков всего 1" in out
+    assert "ПОДТВЕРЖДЁННО ОТСУТСТВУЮТ у биржи (1): 2026-11-17 03:00:00 UTC" in out
+    assert "подтверждённо отсутствуют у биржи свечей всего: 1" in out
+    assert "ПРЕДУПРЕЖДЕНИЕ: пропусков всего" not in out
 
 
 def test_cli_reports_clamped_start(

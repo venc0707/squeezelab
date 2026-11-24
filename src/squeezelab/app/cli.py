@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from collections.abc import Sequence
@@ -43,6 +44,8 @@ from squeezelab.data.downloader import (
     DEFAULT_START,
     WINDOW_BARS,
     RateLimiter,
+    RetryingClient,
+    RetryTally,
     download_tf,
     render_report,
 )
@@ -71,7 +74,15 @@ from squeezelab.data.probe import (
     run_probe,
     to_ms,
 )
+from squeezelab.data.quality import (
+    check_series,
+    cross_check,
+    cross_summary_line,
+    render_markdown,
+    series_summary_line,
+)
 from squeezelab.data.store import CandleStore, StoreError
+from squeezelab.data.sync import render_sync, sync_gaps
 from squeezelab.notify.telegram import TelegramClient, TelegramError, build_test_message
 
 EXIT_OK = 0
@@ -149,6 +160,40 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"баров в окне запроса (1..1440); по умолчанию {WINDOW_BARS} (предел ответа биржи)",
     )
     download.set_defaults(handler=cmd_data_download)
+
+    check = data_sub.add_parser(
+        "check",
+        parents=[common],
+        help="проверить качество сохранённых свечей, сверить ТФ, записать отчёт",
+    )
+    check.add_argument("--symbol", action="append", default=None, help="по умолчанию все пары")
+    check.add_argument("--tf", action="append", default=None, help="по умолчанию все ТФ пары")
+    check.add_argument("--start", default=None, help="начало проверяемого периода, UTC")
+    check.add_argument("--end", default=None, help="конец периода, UTC, исключительно")
+    check.add_argument(
+        "--cross",
+        action="append",
+        default=None,
+        metavar="КРУПНЫЙ:МЕЛКИЙ",
+        help="кросс-проверка ТФ, например 1h:15m (можно несколько раз); по умолчанию 15m:1m",
+    )
+    check.add_argument("--no-cross", action="store_true", help="не делать кросс-проверку")
+    check.add_argument(
+        "--report-dir", default=None, help="каталог отчёта; по умолчанию {каталог данных}/reports"
+    )
+    check.set_defaults(handler=cmd_data_check)
+
+    sync = data_sub.add_parser(
+        "sync",
+        parents=[common],
+        help="докачать пропуски в сохранённых свечах; отсутствующие у биржи пометить",
+    )
+    sync.add_argument("--symbol", action="append", default=None, help="по умолчанию все пары")
+    sync.add_argument("--tf", action="append", default=None, help="по умолчанию все ТФ пары")
+    sync.add_argument("--start", default=None, help="по умолчанию первая сохранённая свеча, UTC")
+    sync.add_argument("--end", default=None, help="по умолчанию последняя закрытая свеча, UTC")
+    sync.add_argument("--base-url", default=LIVE_BASE_URL, help=f"по умолчанию {LIVE_BASE_URL}")
+    sync.set_defaults(handler=cmd_data_sync)
 
     notify = sub.add_parser(
         "notify-test",
@@ -426,6 +471,177 @@ def cmd_bingx_probe_klines(args: argparse.Namespace) -> int:
     return EXIT_FAILURE if failed and len(failed) == len(results) else EXIT_OK
 
 
+def _stored_targets(
+    store: CandleStore, symbols: list[str] | None, tfs: list[str] | None
+) -> list[tuple[str, str]]:
+    """Пары (символ, ТФ) для команд проверки: заданные явно или всё, что есть в хранилище."""
+    targets: list[tuple[str, str]] = []
+    for symbol in symbols or store.symbols():
+        for tf in tfs or store.timeframes(symbol):
+            targets.append((symbol, tf))
+    return targets
+
+
+def _parse_cross(
+    items: list[str] | None, available: dict[str, list[str]]
+) -> list[tuple[str, str, str]]:
+    """Пары кросс-проверки `(символ, крупный, мелкий)`: заданные или 15m:1m там, где есть оба."""
+    if items:
+        pairs = []
+        for item in items:
+            coarse, _, fine = item.partition(":")
+            if not coarse or not fine:
+                raise ValueError(f"--cross {item!r}: ожидается вид КРУПНЫЙ:МЕЛКИЙ, например 1h:15m")
+            pairs.append((coarse, fine))
+        return [(symbol, c, f) for symbol in available for c, f in pairs]
+    return [
+        (symbol, "15m", "1m") for symbol, tfs in available.items() if "15m" in tfs and "1m" in tfs
+    ]
+
+
+def cmd_data_check(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        start_ms = _parse_utc_minute(args.start) if args.start else None
+        end_ms = _parse_utc_minute(args.end) if args.end else None
+    except (ConfigError, ValueError) as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    data_dir = resolve_data_dir(cfg.app)
+    store = CandleStore(data_dir.path)
+    try:
+        targets = _stored_targets(store, args.symbol, args.tf)
+        available: dict[str, list[str]] = {}
+        for symbol, tf in targets:
+            available.setdefault(symbol, []).append(tf)
+        cross_pairs = [] if args.no_cross else _parse_cross(args.cross, available)
+        for _symbol, coarse, fine in cross_pairs:
+            if tf_to_ms(coarse) <= tf_to_ms(fine) or tf_to_ms(coarse) % tf_to_ms(fine):
+                raise ValueError(f"--cross {coarse}:{fine}: крупный ТФ должен делиться на мелкий")
+    except ValueError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    if not targets:
+        print(
+            f"ОШИБКА: в {data_dir.path} нет сохранённых свечей (сначала `data download`)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level)
+
+    now_ms = int(time.time() * 1000)
+    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})\n")
+    series = []
+    crosses = []
+    try:
+        for symbol, tf in targets:
+            report = check_series(
+                store, symbol, tf, now_ms=now_ms, start_ms=start_ms, end_ms=end_ms
+            )
+            series.append(report)
+            print(series_summary_line(report))
+        for symbol, coarse, fine in cross_pairs:
+            cross = cross_check(store, symbol, coarse, fine, start_ms=start_ms, end_ms=end_ms)
+            crosses.append(cross)
+            print(cross_summary_line(cross))
+    except StoreError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    report_dir = Path(args.report_dir) if args.report_dir else data_dir.path / "reports"
+    stamp = datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y%m%d_%H%M%S")
+    path = report_dir / f"quality_{stamp}.md"
+    text = render_markdown(
+        series, crosses, generated_ms=now_ms, data_dir=data_dir.path, version=__version__
+    )
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"ОШИБКА: не удалось записать отчёт: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    problems = sum(len(s.errors) for s in series) + sum(1 for c in crosses if c.mismatched)
+    warnings = sum(len(s.warnings) for s in series)
+    print(f"\nОтчёт: {path}")
+    if problems:
+        print(
+            f"ИТОГ: найдено проблем: {problems}"
+            + (f"; предупреждений: {warnings}" if warnings else "")
+        )
+        return EXIT_FAILURE
+    print("ИТОГ: ошибок нет" + (f"; предупреждений: {warnings}" if warnings else ""))
+    return EXIT_OK
+
+
+def cmd_data_sync(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        start_ms = _parse_utc_minute(args.start) if args.start else None
+        end_ms = _parse_utc_minute(args.end) if args.end else None
+    except (ConfigError, ValueError) as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    data_dir = resolve_data_dir(cfg.app)
+    store = CandleStore(data_dir.path)
+    try:
+        targets = _stored_targets(store, args.symbol, args.tf)
+        for symbol, tf in targets:
+            store.tf_dir(symbol, tf)
+    except ValueError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    if not targets:
+        print(
+            f"ОШИБКА: в {data_dir.path} нет сохранённых свечей (сначала `data download`)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level)
+
+    now_ms = int(time.time() * 1000)
+    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})\n")
+    exit_code = EXIT_OK
+    with BingXPublicClient(args.base_url) as client:
+        limiter = RateLimiter()
+        for symbol, tf in targets:
+            tally = RetryTally()
+            fetcher = RetryingClient(client, time.sleep, tally)
+            try:
+                stored = store.timestamps(symbol, tf)
+                if not stored:
+                    print(f"{symbol} {tf}: нет сохранённых свечей")
+                    continue
+                first = start_ms if start_ms is not None else min(stored)
+                report = sync_gaps(
+                    fetcher,
+                    store,
+                    symbol,
+                    tf,
+                    first,
+                    end_ms if end_ms is not None else now_ms,
+                    now_ms=now_ms,
+                    limiter=limiter,
+                    sleep=time.sleep,
+                    progress=print,
+                )
+            except (BingXError, StoreError) as exc:
+                print(
+                    f"{symbol} {tf}: ОШИБКА: {exc}\n"
+                    "  накопленное сохранено; повторный запуск продолжит",
+                    file=sys.stderr,
+                )
+                exit_code = EXIT_FAILURE
+                continue
+            report.retries = tally.retries
+            report.last_retry_error = tally.last_retry_error
+            for line in render_sync(report):
+                print(line)
+    return exit_code
+
+
 def _probe_depth(args: argparse.Namespace, symbol: str, high_ms: int, now_ms: int) -> int:
     print(f"Поиск начала истории: {args.base_url}, символ {symbol}")
     print(f"Верхняя граница поиска (свечи там есть): {format_ts(high_ms)}")
@@ -491,6 +707,7 @@ def cmd_data_download(args: argparse.Namespace) -> int:
 
     exit_code = EXIT_OK
     gaps = 0
+    confirmed_total = 0
     with BingXPublicClient(args.base_url) as client:
         limiter = RateLimiter()
         for symbol in symbols:
@@ -520,10 +737,16 @@ def cmd_data_download(args: argparse.Namespace) -> int:
                 for line in render_report(report):
                     print(line)
                 gaps += len(report.missing)
+                confirmed_total += len(report.confirmed_missing)
     if gaps:
         print(
             f"\nПРЕДУПРЕЖДЕНИЕ: пропусков всего {gaps}. Повторный запуск попробует их докачать; "
             "пометку «подтверждённо отсутствует» добавит проверка качества (P01-T03)."
+        )
+    if confirmed_total:
+        print(
+            f"\nВНИМАНИЕ: подтверждённо отсутствуют у биржи свечей всего: {confirmed_total} "
+            "(их больше не запрашивают; полный список: `data check`)"
         )
     return exit_code
 
