@@ -16,3 +16,8 @@ recorder:
   symbols: [BNB-USDT]
   oi_interval_s: 60       # опрос открытого интереса, секунд (10..3600)
   funding_interval_s: 60  # опрос текущей и следующей ставки funding, секунд (10..3600)
+# Загрузка и докачка свечей (Phase 01): пары и ТФ, которые держит в порядке `data sync`
+# (таймер squeezelab-sync). Лежит здесь, а не в symbols.yaml, по той же причине.
+downloader:
+  symbols: [BNB-USDT]
+  timeframes: [15m, 1m, 1h, 4h, 1d]

@@ -1,0 +1,12 @@
+# Таймер ежедневной копии данных: через час после докачки (squeezelab-sync в 04:30 UTC).
+[Unit]
+Description=SqueezeLab: ежедневная копия данных
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=squeezelab-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -114,12 +114,45 @@ class RecorderConfig(_Strict):
         return value
 
 
+class DownloaderConfig(_Strict):
+    """Какие пары и ТФ держит в порядке `data sync` (таймер squeezelab-sync). Живёт в app.yaml, а
+    не в symbols.yaml: смена списка не должна менять strategy_hash."""
+
+    symbols: list[str] = Field(default_factory=lambda: ["BNB-USDT"], min_length=1)
+    timeframes: list[str] = Field(
+        default_factory=lambda: ["15m", "1m", "1h", "4h", "1d"], min_length=1
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols_ok(cls, value: list[str]) -> list[str]:
+        pattern = re.compile(_SYMBOL_PATTERN)
+        for symbol in value:
+            if not pattern.match(symbol):
+                raise ValueError(f"символ {symbol!r}: ожидается вид BNB-USDT")
+        if len(set(value)) != len(value):
+            raise ValueError("символ указан дважды")
+        return value
+
+    @field_validator("timeframes")
+    @classmethod
+    def _timeframes_ok(cls, value: list[str]) -> list[str]:
+        pattern = re.compile(_TF_PATTERN)
+        for tf in value:
+            if not pattern.match(tf):
+                raise ValueError(f"таймфрейм {tf!r}: ожидается вид 15m, 1h, 1d")
+        if len(set(value)) != len(value):
+            raise ValueError("таймфрейм указан дважды")
+        return value
+
+
 class AppConfig(_Strict):
     mode: Mode = Mode.SIGNALS_ONLY
     timezone: Literal["UTC"] = "UTC"
     paths: PathsConfig
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     recorder: RecorderConfig = Field(default_factory=RecorderConfig)
+    downloader: DownloaderConfig = Field(default_factory=DownloaderConfig)
 
 
 # ----------------------------------------------------------------------- presets.yaml

@@ -1,6 +1,7 @@
 """Командная строка SqueezeLab.
 
-Коды выхода: 0 — успех, 1 — сбой операции (сеть, API), 2 — ошибка конфигурации или аргументов.
+Коды выхода: 0 — успех, 1 — сбой операции (сеть, API) или дефекты данных, 2 — ошибка
+конфигурации или аргументов, 3 — после `data sync` остались неподтверждённые пропуски.
 """
 
 from __future__ import annotations
@@ -81,13 +82,21 @@ from squeezelab.data.quality import (
     render_markdown,
     series_summary_line,
 )
-from squeezelab.data.store import CandleStore, StoreError
+from squeezelab.data.resample import (
+    compare_layers,
+    render_comparison,
+    render_resample,
+    render_resample_markdown,
+    resample_range,
+)
+from squeezelab.data.store import RESAMPLED_LAYER, CandleStore, StoreError
 from squeezelab.data.sync import render_sync, sync_gaps
 from squeezelab.notify.telegram import TelegramClient, TelegramError, build_test_message
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG = 2
+EXIT_GAPS = 3
 
 
 def _common_options() -> argparse.ArgumentParser:
@@ -179,6 +188,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--no-cross", action="store_true", help="не делать кросс-проверку")
     check.add_argument(
+        "--layer",
+        choices=("native", "resampled", "all"),
+        default="all",
+        help="слой хранилища: нативные свечи биржи, ресемпл или оба (по умолчанию)",
+    )
+    check.add_argument(
         "--report-dir", default=None, help="каталог отчёта; по умолчанию {каталог данных}/reports"
     )
     check.set_defaults(handler=cmd_data_check)
@@ -186,14 +201,38 @@ def build_parser() -> argparse.ArgumentParser:
     sync = data_sub.add_parser(
         "sync",
         parents=[common],
-        help="докачать пропуски в сохранённых свечах; отсутствующие у биржи пометить",
+        help="докачать новые свечи и пропуски; отсутствующие у биржи пометить; код 3 при остатке",
     )
-    sync.add_argument("--symbol", action="append", default=None, help="по умолчанию все пары")
-    sync.add_argument("--tf", action="append", default=None, help="по умолчанию все ТФ пары")
+    sync.add_argument(
+        "--symbol", action="append", default=None, help="по умолчанию downloader.symbols"
+    )
+    sync.add_argument(
+        "--tf", action="append", default=None, help="по умолчанию downloader.timeframes"
+    )
     sync.add_argument("--start", default=None, help="по умолчанию первая сохранённая свеча, UTC")
     sync.add_argument("--end", default=None, help="по умолчанию последняя закрытая свеча, UTC")
     sync.add_argument("--base-url", default=LIVE_BASE_URL, help=f"по умолчанию {LIVE_BASE_URL}")
     sync.set_defaults(handler=cmd_data_sync)
+
+    resample = data_sub.add_parser(
+        "resample",
+        parents=[common],
+        help="собрать 15m из 1m в отдельный слой и сверить с нативным 15m (вердикт)",
+    )
+    resample.add_argument(
+        "--symbol", action="append", default=None, help="по умолчанию downloader.symbols"
+    )
+    resample.add_argument("--from", dest="fine_tf", default="1m", help="мелкий ТФ, по умолчанию 1m")
+    resample.add_argument(
+        "--to", dest="coarse_tf", default="15m", help="крупный ТФ, по умолчанию 15m"
+    )
+    resample.add_argument("--start", default=None, help="начало периода, UTC")
+    resample.add_argument("--end", default=None, help="конец периода, UTC, исключительно")
+    resample.add_argument("--no-compare", action="store_true", help="не сверять с нативным")
+    resample.add_argument(
+        "--report-dir", default=None, help="каталог отчёта; по умолчанию {каталог данных}/reports"
+    )
+    resample.set_defaults(handler=cmd_data_resample)
 
     notify = sub.add_parser(
         "notify-test",
@@ -499,6 +538,15 @@ def _parse_cross(
     ]
 
 
+def _write_report(report_dir: Path, name: str, text: str) -> Path:
+    path = report_dir / name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 def cmd_data_check(args: argparse.Namespace) -> int:
     try:
         cfg = _load_config(args.config_dir)
@@ -509,10 +557,24 @@ def cmd_data_check(args: argparse.Namespace) -> int:
         return EXIT_CONFIG
     data_dir = resolve_data_dir(cfg.app)
     store = CandleStore(data_dir.path)
+    derived = CandleStore(data_dir.path, layer=RESAMPLED_LAYER)
     try:
-        targets = _stored_targets(store, args.symbol, args.tf)
+        native_targets = (
+            [] if args.layer == "resampled" else _stored_targets(store, args.symbol, args.tf)
+        )
+        if args.layer == "resampled":
+            derived_targets = _stored_targets(derived, args.symbol, args.tf)
+        elif args.layer == "all":
+            # рядом с нативными проверяем только те ряды ресемпла, которые есть
+            derived_targets = [
+                (symbol, tf)
+                for symbol, tf in _stored_targets(derived, args.symbol, args.tf)
+                if tf in derived.timeframes(symbol)
+            ]
+        else:
+            derived_targets = []
         available: dict[str, list[str]] = {}
-        for symbol, tf in targets:
+        for symbol, tf in native_targets:
             available.setdefault(symbol, []).append(tf)
         cross_pairs = [] if args.no_cross else _parse_cross(args.cross, available)
         for _symbol, coarse, fine in cross_pairs:
@@ -521,7 +583,7 @@ def cmd_data_check(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ОШИБКА: {exc}", file=sys.stderr)
         return EXIT_CONFIG
-    if not targets:
+    if not native_targets and not derived_targets:
         print(
             f"ОШИБКА: в {data_dir.path} нет сохранённых свечей (сначала `data download`)",
             file=sys.stderr,
@@ -534,12 +596,13 @@ def cmd_data_check(args: argparse.Namespace) -> int:
     series = []
     crosses = []
     try:
-        for symbol, tf in targets:
-            report = check_series(
-                store, symbol, tf, now_ms=now_ms, start_ms=start_ms, end_ms=end_ms
-            )
-            series.append(report)
-            print(series_summary_line(report))
+        for layer_store, targets in ((store, native_targets), (derived, derived_targets)):
+            for symbol, tf in targets:
+                report = check_series(
+                    layer_store, symbol, tf, now_ms=now_ms, start_ms=start_ms, end_ms=end_ms
+                )
+                series.append(report)
+                print(series_summary_line(report))
         for symbol, coarse, fine in cross_pairs:
             cross = cross_check(store, symbol, coarse, fine, start_ms=start_ms, end_ms=end_ms)
             crosses.append(cross)
@@ -550,15 +613,11 @@ def cmd_data_check(args: argparse.Namespace) -> int:
 
     report_dir = Path(args.report_dir) if args.report_dir else data_dir.path / "reports"
     stamp = datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y%m%d_%H%M%S")
-    path = report_dir / f"quality_{stamp}.md"
     text = render_markdown(
         series, crosses, generated_ms=now_ms, data_dir=data_dir.path, version=__version__
     )
     try:
-        report_dir.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        path = _write_report(report_dir, f"quality_{stamp}.md", text)
     except OSError as exc:
         print(f"ОШИБКА: не удалось записать отчёт: {exc}", file=sys.stderr)
         return EXIT_FAILURE
@@ -586,24 +645,22 @@ def cmd_data_sync(args: argparse.Namespace) -> int:
         return EXIT_CONFIG
     data_dir = resolve_data_dir(cfg.app)
     store = CandleStore(data_dir.path)
+    symbols: list[str] = args.symbol or cfg.app.downloader.symbols
+    tfs: list[str] = args.tf or cfg.app.downloader.timeframes
+    targets = [(symbol, tf) for symbol in symbols for tf in tfs]
     try:
-        targets = _stored_targets(store, args.symbol, args.tf)
         for symbol, tf in targets:
             store.tf_dir(symbol, tf)
     except ValueError as exc:
         print(f"ОШИБКА: {exc}", file=sys.stderr)
         return EXIT_CONFIG
-    if not targets:
-        print(
-            f"ОШИБКА: в {data_dir.path} нет сохранённых свечей (сначала `data download`)",
-            file=sys.stderr,
-        )
-        return EXIT_CONFIG
     configure_logging(cfg.app.log_level)
 
     now_ms = int(time.time() * 1000)
-    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})\n")
+    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})")
+    print(f"Пары: {', '.join(symbols)}; таймфреймы: {', '.join(tfs)}\n")
     exit_code = EXIT_OK
+    remaining = 0
     with BingXPublicClient(args.base_url) as client:
         limiter = RateLimiter()
         for symbol, tf in targets:
@@ -612,7 +669,10 @@ def cmd_data_sync(args: argparse.Namespace) -> int:
             try:
                 stored = store.timestamps(symbol, tf)
                 if not stored:
-                    print(f"{symbol} {tf}: нет сохранённых свечей")
+                    print(
+                        f"{symbol} {tf}: ВНИМАНИЕ: нет сохранённых свечей (сначала `data download`)"
+                    )
+                    remaining += 1
                     continue
                 first = start_ms if start_ms is not None else min(stored)
                 report = sync_gaps(
@@ -637,8 +697,95 @@ def cmd_data_sync(args: argparse.Namespace) -> int:
                 continue
             report.retries = tally.retries
             report.last_retry_error = tally.last_retry_error
+            remaining += len(report.pending)
             for line in render_sync(report):
                 print(line)
+    if exit_code != EXIT_OK:
+        return exit_code
+    if remaining:
+        print(
+            f"\nОСТАЛИСЬ ПРОПУСКИ: {remaining} (неподтверждённых слотов и пар без данных); "
+            f"код выхода {EXIT_GAPS}"
+        )
+        return EXIT_GAPS
+    print("\nПропусков не осталось")
+    return EXIT_OK
+
+
+def cmd_data_resample(args: argparse.Namespace) -> int:
+    try:
+        cfg = _load_config(args.config_dir)
+        start_ms = _parse_utc_minute(args.start) if args.start else None
+        end_ms = _parse_utc_minute(args.end) if args.end else None
+        if tf_to_ms(args.coarse_tf) <= tf_to_ms(args.fine_tf) or tf_to_ms(
+            args.coarse_tf
+        ) % tf_to_ms(args.fine_tf):
+            raise ValueError(f"{args.coarse_tf} должен делиться нацело на {args.fine_tf}")
+    except (ConfigError, ValueError) as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    data_dir = resolve_data_dir(cfg.app)
+    native = CandleStore(data_dir.path)
+    derived = CandleStore(data_dir.path, layer=RESAMPLED_LAYER)
+    symbols: list[str] = args.symbol or cfg.app.downloader.symbols
+    try:
+        for symbol in symbols:
+            native.tf_dir(symbol, args.fine_tf)
+            native.tf_dir(symbol, args.coarse_tf)
+    except ValueError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    configure_logging(cfg.app.log_level)
+
+    now_ms = int(time.time() * 1000)
+    print(f"Каталог данных: {data_dir.path} (источник: {data_dir.source})\n")
+    reports = []
+    comparisons = []
+    exit_code = EXIT_OK
+    try:
+        for symbol in symbols:
+            report = resample_range(
+                native,
+                derived,
+                symbol,
+                args.fine_tf,
+                args.coarse_tf,
+                now_ms=now_ms,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            reports.append(report)
+            for line in render_resample(report):
+                print(line)
+            if args.no_compare:
+                continue
+            comparison = compare_layers(
+                native, derived, symbol, args.coarse_tf, start_ms=start_ms, end_ms=end_ms
+            )
+            comparisons.append(comparison)
+            for line in render_comparison(comparison):
+                print(line)
+            if comparison.verdict == "not_acceptable":
+                exit_code = EXIT_FAILURE
+    except StoreError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    if not any(r.buckets for r in reports):
+        print(
+            f"ОШИБКА: нет сохранённых {args.fine_tf} для ресемпла (сначала `data download`)",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+    report_dir = Path(args.report_dir) if args.report_dir else data_dir.path / "reports"
+    stamp = datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y%m%d_%H%M%S")
+    text = render_resample_markdown(reports, comparisons, generated_ms=now_ms, version=__version__)
+    try:
+        path = _write_report(report_dir, f"resample_{stamp}.md", text)
+    except OSError as exc:
+        print(f"ОШИБКА: не удалось записать отчёт: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    print(f"\nОтчёт: {path}")
     return exit_code
 
 

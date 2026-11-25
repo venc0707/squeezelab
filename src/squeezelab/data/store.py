@@ -12,6 +12,9 @@
 - если биржа прислала для уже сохранённого `ts_open` другие значения, побеждают новые, а в
   статистике записи это видно как `updated`;
 - данные автоматически не удаляются (правило 4 задания);
+- у хранилища два слоя с одинаковой раскладкой: нативные свечи биржи в `candles/` и производные
+  (ресемпл из мелкого ТФ) в `candles_resampled/`; слои не смешиваются, происхождение свечи
+  определяется каталогом (`CandleStore.src`), читающий API (`data/reader.py`) отдаёт его явно;
 - рядом с файлами месяцев лежит реестр `confirmed_missing.json`: свечи, которых у биржи нет
   (P01-T03). Реестр не данные, а пометка, чтобы пропуск не запрашивали бесконечно; когда свеча
   всё же появляется в хранилище, запись о ней из реестра убирается сама.
@@ -99,9 +102,22 @@ def month_start_ms(year: int, month: int) -> int:
     return int(datetime(year, month, 1, tzinfo=UTC).timestamp() * 1000)
 
 
+NATIVE_LAYER = "candles"
+RESAMPLED_LAYER = "candles_resampled"
+_LAYER_SOURCES = {NATIVE_LAYER: "native", RESAMPLED_LAYER: "resampled"}
+
+
 class CandleStore:
-    def __init__(self, data_dir: Path | str) -> None:
+    def __init__(self, data_dir: Path | str, *, layer: str = NATIVE_LAYER) -> None:
+        if layer not in _LAYER_SOURCES:
+            raise ValueError(f"слой {layer!r}: ожидается {sorted(_LAYER_SOURCES)}")
         self.root = Path(data_dir)
+        self.layer = layer
+
+    @property
+    def src(self) -> str:
+        """Происхождение свечей слоя: `native` (биржа отдала) или `resampled` (собрано нами)."""
+        return _LAYER_SOURCES[self.layer]
 
     # ------------------------------------------------------------------ пути
 
@@ -110,7 +126,7 @@ class CandleStore:
             raise ValueError(f"символ {symbol!r}: ожидается вид BNB-USDT")
         if not _TF_RE.match(tf):
             raise ValueError(f"таймфрейм {tf!r}: ожидается вид 15m, 1h, 1d")
-        return self.root / "candles" / symbol / tf
+        return self.root / self.layer / symbol / tf
 
     def month_path(self, symbol: str, tf: str, year: int, month: int) -> Path:
         return self.tf_dir(symbol, tf) / f"{year:04d}-{month:02d}.parquet"
@@ -127,14 +143,14 @@ class CandleStore:
 
     def symbols(self) -> list[str]:
         """Пары, для которых есть каталог со свечами."""
-        base = self.root / "candles"
+        base = self.root / self.layer
         if not base.is_dir():
             return []
         return sorted(p.name for p in base.iterdir() if p.is_dir() and _SYMBOL_RE.match(p.name))
 
     def timeframes(self, symbol: str) -> list[str]:
         """Таймфреймы пары, у которых есть файлы свечей, от короткого к длинному."""
-        base = self.root / "candles" / symbol
+        base = self.root / self.layer / symbol
         if not _SYMBOL_RE.match(symbol) or not base.is_dir():
             return []
         found = [p.name for p in base.iterdir() if p.is_dir() and _TF_RE.match(p.name)]

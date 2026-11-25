@@ -1,0 +1,28 @@
+# SqueezeLab: ежедневная докачка свечей (`squeezelab data sync`).
+# Шаблон: @USER@, @WORKDIR@ и @DATA_DIR@ подставляет deploy/install.sh. Правьте шаблон, а не
+# установленный файл в /etc/systemd/system.
+#
+# Код выхода 3 значит «остались неподтверждённые пропуски»: юнит получит статус failed, данные
+# при этом сохранены, детали в журнале (`journalctl -u squeezelab-sync`).
+[Unit]
+Description=SqueezeLab: ежедневная докачка свечей (data sync)
+Documentation=file://@WORKDIR@/docs/runbook.md
+After=network-online.target
+Wants=network-online.target
+# Данные лежат на отдельном диске: без него не запускаться, чтобы не писать на системный.
+RequiresMountsFor=@DATA_DIR@
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@WORKDIR@
+Environment=SQUEEZELAB_DATA_DIR=@DATA_DIR@
+ExecStart=@WORKDIR@/.venv/bin/squeezelab data sync
+TimeoutStartSec=3h
+Nice=10
+# Изоляция: пишет только в каталог данных.
+ProtectSystem=strict
+ReadWritePaths=@DATA_DIR@
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes

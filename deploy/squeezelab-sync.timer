@@ -1,0 +1,13 @@
+# Таймер ежедневной докачки свечей. Время в UTC; пропущенный запуск (сервер был выключен)
+# выполняется при следующем включении.
+[Unit]
+Description=SqueezeLab: ежедневная докачка свечей
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=squeezelab-sync.service
+
+[Install]
+WantedBy=timers.target

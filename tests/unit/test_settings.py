@@ -26,7 +26,7 @@ from squeezelab.app.settings import (
 REPO_CONFIG = Path(__file__).resolve().parents[2] / "config"
 
 PINNED_STRATEGY_HASH = "3a4474d65a98ddc6921bbe848a5b8ec54dab5fa34cbcd96e7773102cf60a2c66"
-PINNED_APP_HASH = "ba9ad58477eeeea59d6766731003c6f57e2c90524b442066841f71bc555419fe"
+PINNED_APP_HASH = "6890f83695a8c1fd8b2ef6615943cb02bf548c6998ef8300da1f7c224b1195d0"
 
 
 @pytest.fixture
@@ -291,6 +291,41 @@ def test_recorder_validation(cfg_dir: Path, old: str, new: str, fragment: str) -
         load_project_config(cfg_dir)
 
 
+def test_downloader_defaults_match_repo_config() -> None:
+    downloader = load_project_config(REPO_CONFIG).app.downloader
+    assert downloader.symbols == ["BNB-USDT"]
+    assert downloader.timeframes == ["15m", "1m", "1h", "4h", "1d"]
+
+
+def test_downloader_section_is_optional(cfg_dir: Path) -> None:
+    text = (cfg_dir / "app.yaml").read_text(encoding="utf-8")
+    cut = text[: text.index("downloader:")]
+    (cfg_dir / "app.yaml").write_text(cut, encoding="utf-8")
+    downloader = load_project_config(cfg_dir).app.downloader
+    assert downloader.timeframes == ["15m", "1m", "1h", "4h", "1d"]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "fragment"),
+    [
+        ("symbols: [BNB-USDT]\n  timeframes", "symbols: []\n  timeframes", "downloader.symbols"),
+        ("symbols: [BNB-USDT]\n  timeframes", "symbols: [bnbusdt]\n  timeframes", "ожидается вид"),
+        (
+            "symbols: [BNB-USDT]\n  timeframes",
+            "symbols: [BNB-USDT, BNB-USDT]\n  timeframes",
+            "дважды",
+        ),
+        ("timeframes: [15m, 1m, 1h, 4h, 1d]", "timeframes: []", "downloader.timeframes"),
+        ("timeframes: [15m, 1m, 1h, 4h, 1d]", "timeframes: [15x]", "ожидается вид 15m"),
+        ("timeframes: [15m, 1m, 1h, 4h, 1d]", "timeframes: [15m, 15m]", "дважды"),
+    ],
+)
+def test_downloader_validation(cfg_dir: Path, old: str, new: str, fragment: str) -> None:
+    _edit(cfg_dir, "app.yaml", old, new)
+    with pytest.raises(ConfigError, match=fragment):
+        load_project_config(cfg_dir)
+
+
 def test_data_dir_may_be_omitted(cfg_dir: Path) -> None:
     (cfg_dir / "app.yaml").write_text("paths:\n  logs_dir: logs\n", encoding="utf-8")
     assert load_project_config(cfg_dir).app.paths.data_dir is None
@@ -355,6 +390,7 @@ def test_strategy_hash_changes_with_strategy_files_only(
         ("data_dir: data", "data_dir: /srv/data/squeezelab"),
         ("symbols: [BNB-USDT]", "symbols: [BNB-USDT, ETH-USDT]"),
         ("oi_interval_s: 60", "oi_interval_s: 120"),
+        ("timeframes: [15m, 1m, 1h, 4h, 1d]", "timeframes: [15m, 1m]"),
     ],
 )
 def test_app_hash_changes_with_app_yaml_only(cfg_dir: Path, old: str, new: str) -> None:

@@ -1,0 +1,21 @@
+# SqueezeLab: ежедневная копия данных на другой физический диск.
+# `rsync -a` БЕЗ --delete: файлы, пропавшие в источнике, в копии остаются (данные не удаляются).
+# Шаблон: @USER@, @DATA_DIR@, @BACKUP_DIR@ и @RSYNC@ подставляет deploy/install.sh.
+[Unit]
+Description=SqueezeLab: ежедневная копия данных (rsync -a, без --delete)
+ConditionPathIsDirectory=@DATA_DIR@
+RequiresMountsFor=@DATA_DIR@ @BACKUP_DIR@
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=@RSYNC@ -a @DATA_DIR@/ @BACKUP_DIR@/
+Nice=10
+IOSchedulingClass=idle
+# Изоляция: читает данные, пишет только в каталог копии.
+ProtectSystem=strict
+ReadOnlyPaths=@DATA_DIR@
+ReadWritePaths=@BACKUP_DIR@
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

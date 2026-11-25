@@ -46,6 +46,7 @@ class CheckResult:
 class SeriesReport:
     symbol: str
     tf: str
+    src: str = "native"  # слой хранилища: native или resampled
     files: int = 0
     rows: int = 0  # строк во всех файлах (дубли считаются)
     unique: int = 0
@@ -117,7 +118,7 @@ def check_series(
 ) -> SeriesReport:
     """Все проверки одного ряда. `start_ms` включительно, `end_ms` исключительно."""
     tf_ms = tf_to_ms(tf)
-    report = SeriesReport(symbol, tf)
+    report = SeriesReport(symbol, tf, src=store.src)
     try:
         raw = store.read_raw(symbol, tf)
     except StoreError as exc:
@@ -352,8 +353,12 @@ def cross_check(
 # ----------------------------------------------------------------------------- отчёт
 
 
+def _label(report: SeriesReport) -> str:
+    return report.tf if report.src == "native" else f"{report.tf} [ресемпл]"
+
+
 def series_summary_line(report: SeriesReport) -> str:
-    head = f"{report.symbol} {report.tf}: {report.unique} свечей"
+    head = f"{report.symbol} {_label(report)}: {report.unique} свечей"
     if report.first_ts is not None and report.last_ts is not None:
         head += f", {_utc(report.first_ts)} .. {_utc(report.last_ts)}"
     if report.ok and not report.warnings:
@@ -410,11 +415,11 @@ def render_markdown(
             else "-"
         )
         lines.append(
-            f"| {s.symbol} | {s.tf} | {s.unique} | {period} | {s.expected} | "
+            f"| {s.symbol} | {_label(s)} | {s.unique} | {period} | {s.expected} | "
             f"{len(s.errors)} | {len(s.warnings)} |"
         )
     for s in series:
-        lines += ["", f"## {s.symbol} {s.tf}", ""]
+        lines += ["", f"## {s.symbol} {_label(s)}", ""]
         lines.append(f"Файлов: {s.files}; строк: {s.rows}; уникальных свечей: {s.unique}.")
         if s.lag_ms is not None:
             hours = s.lag_ms / 3_600_000

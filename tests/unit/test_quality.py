@@ -580,14 +580,14 @@ def test_cli_sync_fills_and_confirms(
     absent_at_exchange = {hole}
     put(store, [r for r in rows if r.ts_open not in {START + 10 * TF, hole}])
     patch_exchange(monkeypatch, FakeBingX(Behaviour(holes=frozenset(absent_at_exchange))))
-    assert run_cli("data", "sync", "--end", "2026-11-01T15:00") == 0
+    assert run_cli("data", "sync", "--tf", "15m", "--end", "2026-11-01T15:00") == 0
     out = capsys.readouterr().out
     assert "BNB-USDT 15m: докачка пропусков" in out
     assert "найдено пропусков: 2; докачано: 1; подтверждённо отсутствуют (новых): 1" in out
     assert START + 10 * TF in store.timestamps(SYMBOL, "15m")
     assert set(store.confirmed_missing(SYMBOL, "15m")) == {hole}
 
-    assert run_cli("data", "sync", "--end", "2026-11-01T15:00") == 0
+    assert run_cli("data", "sync", "--tf", "15m", "--end", "2026-11-01T15:00") == 0
     again = capsys.readouterr().out
     assert "пропусков нет" in again
     assert "ранее подтверждённо отсутствуют у биржи: 1" in again
@@ -599,15 +599,19 @@ def test_cli_sync_api_failure_exits_one(
     store = CandleStore(data_env)
     put(store, [r for r in exchange_candles(START, 30) if r.ts_open != START + 5 * TF])
     patch_exchange(monkeypatch, FakeBingX(fail_after=0))
-    assert run_cli("data", "sync", "--end", "2026-11-01T08:00") == 1
+    assert run_cli("data", "sync", "--tf", "15m", "--end", "2026-11-01T08:00") == 1
     assert "ОШИБКА" in capsys.readouterr().err
 
 
-def test_cli_sync_without_data_is_a_configuration_error(
+def test_cli_sync_without_data_leaves_gaps_for_every_configured_pair(
     capsys: pytest.CaptureFixture[str], data_env: Path
 ) -> None:
-    assert run_cli("data", "sync") == 2
-    assert "нет сохранённых свечей" in capsys.readouterr().err
+    assert run_cli("data", "sync") == 3  # по умолчанию пары и ТФ из app.yaml, данных нет
+    out = capsys.readouterr().out
+    assert "Пары: BNB-USDT; таймфреймы: 15m, 1m, 1h, 4h, 1d" in out
+    for tf in ("15m", "1m", "1h", "4h", "1d"):
+        assert f"BNB-USDT {tf}: ВНИМАНИЕ: нет сохранённых свечей" in out
+    assert "ОСТАЛИСЬ ПРОПУСКИ: 5" in out
 
 
 def test_cli_sync_rejects_bad_timeframe(capsys: pytest.CaptureFixture[str], data_env: Path) -> None:
