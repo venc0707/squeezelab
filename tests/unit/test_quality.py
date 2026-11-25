@@ -251,7 +251,7 @@ def test_markdown_report_lists_checks_and_examples(store: CandleStore) -> None:
     report = check_series(store, SYMBOL, "15m", now_ms=NOW)
     text = render_markdown([report], [], generated_ms=NOW, data_dir=Path("/srv/x"), version="9.9")
     assert text.startswith("# Отчёт о качестве данных SqueezeLab")
-    assert "- Каталог данных: `/srv/x`" in text
+    assert f"- Каталог данных: `{Path('/srv/x')}`" in text  # на Windows разделитель другой
     assert "найдено проблем: 1" in text
     assert "| BNB-USDT | 15m | 99 |" in text
     assert (
