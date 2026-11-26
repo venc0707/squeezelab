@@ -69,3 +69,11 @@ def test_resolution_creates_nothing(tmp_path: Path) -> None:
     target = tmp_path / "ещё-нет"
     resolve_data_dir(_app("x"), {DATA_DIR_ENV: str(target)})
     assert not target.exists()
+
+
+def test_tests_do_not_see_the_project_environment() -> None:
+    """Страховка от падений только на машинах, где SQUEEZELAB_DATA_DIR уже экспортирована."""
+    import os
+
+    assert DATA_DIR_ENV not in os.environ
+    assert "SQUEEZELAB_CONFIG_DIR" not in os.environ
