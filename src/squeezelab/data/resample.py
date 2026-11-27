@@ -23,10 +23,12 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from squeezelab.data.models import Candle, format_ts, tf_to_ms
-from squeezelab.data.quality import PRICE_TOL, VOLUME_TOL
+from squeezelab.data.quality import OHLC_EXCEPTION_SHARE, PRICE_TOL, VOLUME_TOL
 from squeezelab.data.store import CandleStore, ConfirmedMissing, WriteStats
 
-EXCEPTION_SHARE = 0.001  # доля баров с расхождением OHLC, до которой ресемпл допускается
+EXCEPTION_SHARE = (
+    OHLC_EXCEPTION_SHARE  # доля баров с расхождением OHLC, до которой ресемпл допустим
+)
 MAX_DETAILS = 5000  # сколько расхождений держим в памяти для отчёта
 Verdict = Literal["acceptable", "acceptable_with_exceptions", "not_acceptable", "no_overlap"]
 _FIELDS = ("open", "high", "low", "close", "volume")

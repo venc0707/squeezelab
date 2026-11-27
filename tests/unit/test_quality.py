@@ -343,7 +343,93 @@ def test_cross_check_finds_volume_and_price_mismatches(store: CandleStore) -> No
     assert report.max_abs["volume"] == pytest.approx(1.0)
     assert report.max_abs["open"] == pytest.approx(0.5)
     assert any("volume:" in e and "2026-11-01 00:30" in e for e in report.examples)
-    assert "РАСХОЖДЕНИЯ в 2 свечах (volume ×1, open ×1, high ×1)" in cross_summary_line(report)
+    assert (report.mismatched_ohlc, report.mismatched_volume) == (1, 1)
+    assert report.severity == "error"  # 1 из 16 баров: далеко за порогами
+    line = cross_summary_line(report)
+    assert "РАСХОЖДЕНИЯ: OHLC в 1 барах (6.250 %), объём в 1 барах (6.250 %)" in line
+    assert "(volume ×1, open ×1, high ×1)" in line
+
+
+def big_pair(store: CandleStore, bars: int = 2000) -> list[Candle]:
+    """Длинный ряд 1m и 15m (по 15 минуток): нужен, чтобы проверять доли расхождений."""
+    fine = one_minute(START, bars * 15)
+    coarse = aggregate(fine, START, 15, TF)
+    put(store, fine, "1m")
+    put(store, coarse, "15m")
+    return coarse
+
+
+def volume_bump(bar: Candle, extra: float = 2.0) -> Candle:
+    return Candle(bar.ts_open, bar.o, bar.h, bar.l, bar.c, bar.v + extra)
+
+
+def price_bump(bar: Candle) -> Candle:
+    return Candle(bar.ts_open, bar.o, bar.h, bar.l, bar.c + 0.2, bar.v)
+
+
+def test_rare_cross_mismatches_are_exceptions_not_errors(store: CandleStore) -> None:
+    coarse = big_pair(store)
+    put(store, [volume_bump(coarse[7]), price_bump(coarse[100])])  # 1 по объёму и 1 по OHLC из 2000
+    report = cross_check(store, SYMBOL, "15m", "1m")
+    assert (report.compared, report.mismatched) == (2000, 2)
+    assert (report.mismatched_ohlc, report.mismatched_volume) == (1, 1)  # по одному бару
+    assert report.severity == "warning"
+    assert not report.ok  # расхождения есть, но допустимые
+    line = cross_summary_line(report)
+    assert "допустимые исключения (предупреждение): OHLC в 1 барах (0.050 %)" in line
+    assert len(report.examples) == 2
+
+
+def test_cross_mismatches_above_the_thresholds_are_errors(store: CandleStore) -> None:
+    coarse = big_pair(store)
+    put(store, [price_bump(coarse[i]) for i in (1, 2, 3)])  # 3 из 2000 = 0,15 % OHLC
+    assert cross_check(store, SYMBOL, "15m", "1m").severity == "error"
+
+
+def test_one_percent_of_volume_mismatches_is_the_error_boundary(store: CandleStore) -> None:
+    coarse = big_pair(store)
+    put(store, [volume_bump(coarse[i]) for i in range(19)])  # 19 из 2000 = 0,95 %
+    assert cross_check(store, SYMBOL, "15m", "1m").severity == "warning"
+    put(store, [volume_bump(coarse[i]) for i in range(20)])  # 20 из 2000 = 1,0 %
+    report = cross_check(store, SYMBOL, "15m", "1m")
+    assert report.severity == "error"
+    assert (report.mismatched_ohlc, report.mismatched_volume) == (0, 20)
+
+
+def test_cross_examples_are_listed_up_to_fifty(store: CandleStore) -> None:
+    coarse = big_pair(store)
+    put(store, [volume_bump(coarse[i]) for i in range(60)])
+    report = cross_check(store, SYMBOL, "15m", "1m")
+    assert report.mismatched == 60
+    assert len(report.examples) == 50
+
+
+def test_markdown_calls_rare_mismatches_exceptions(store: CandleStore) -> None:
+    coarse = big_pair(store)
+    put(store, [volume_bump(coarse[7])])
+    text = render_markdown(
+        [check_series(store, SYMBOL, "15m", now_ms=NOW)],
+        [cross_check(store, SYMBOL, "15m", "1m")],
+        generated_ms=NOW,
+        data_dir=Path("/d"),
+        version="1",
+    )
+    assert "**допустимые исключения (предупреждение)**" in text
+    assert "**ошибок нет**; предупреждений: 1" in text
+
+
+def test_cli_check_exits_zero_with_a_warning_for_rare_cross_mismatches(
+    capsys: pytest.CaptureFixture[str], data_env: Path
+) -> None:
+    store = CandleStore(data_env)
+    coarse = big_pair(store)
+    put(store, [volume_bump(coarse[7])])
+    assert run_cli("data", "check") == 0
+    out = capsys.readouterr().out
+    assert "допустимые исключения (предупреждение)" in out
+    assert "ИТОГ: ошибок нет; предупреждений: 1" in out
+    (report,) = (data_env / "reports").glob("quality_*.md")
+    assert "Список расхождений (первые 1):" in report.read_text(encoding="utf-8")
 
 
 def test_cross_check_tolerates_float_noise(store: CandleStore) -> None:
@@ -415,7 +501,9 @@ def test_markdown_contains_cross_check_section(store: CandleStore) -> None:
     )
     assert "## Кросс-проверка ТФ" in text
     assert "### BNB-USDT: 15m против агрегата из 1m" in text
-    assert "**расхождения в 1 свечах**" in text
+    assert "**РАСХОЖДЕНИЯ больше порогов**: OHLC в 0 барах" in text
+    assert "объём в 1 барах (6.250 %, порог 1 %)" in text
+    assert "Список расхождений (первые 1):" in text
     assert "| volume | 1 |" in text
     assert "найдено проблем: 1" in text
 
@@ -484,7 +572,7 @@ def test_cli_check_exits_one_on_cross_mismatch(
     )
     assert run_cli("data", "check") == 1
     out = capsys.readouterr().out
-    assert "РАСХОЖДЕНИЯ в 1 свечах (volume ×1)" in out
+    assert "РАСХОЖДЕНИЯ: OHLC в 0 барах (0.000 %), объём в 1 барах (6.250 %) (volume ×1)" in out
 
 
 def test_cli_check_options(capsys: pytest.CaptureFixture[str], data_env: Path) -> None:

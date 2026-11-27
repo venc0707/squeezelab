@@ -8,6 +8,12 @@
 `cross_check` сверяет крупный ТФ с агрегатом из мелкого (15m из 1m, 1h из 15m и так далее):
 open первой, close последней, максимум high, минимум low, сумма объёма. Расхождение цен
 допускается не больше 1e-9, объёма не больше 1e-6 (суммы float дают шум порядка 1e-13).
+
+Расхождения между нативным крупным ТФ и агрегатом из мелкого бывают у самой биржи (поздние сделки,
+границы корзин), поэтому единичные считаются допустимыми исключениями (предупреждение), а
+массовые ошибкой: OHLC в доле баров меньше `OHLC_EXCEPTION_SHARE` (0,1 %, порог мастера из
+поправки B) и объём в доле меньше `VOLUME_EXCEPTION_SHARE` (1 %, порог рабочего чата, правила
+мастера для объёма нет). Все расхождения перечисляются в отчёте.
 """
 
 from __future__ import annotations
@@ -24,6 +30,9 @@ from squeezelab.data.store import CandleStore, StoreError, month_of
 
 Severity = Literal["error", "warning"]
 MAX_EXAMPLES = 8
+MAX_CROSS_EXAMPLES = 50
+OHLC_EXCEPTION_SHARE = 0.001  # доля баров с расхождением OHLC, до которой это исключения
+VOLUME_EXCEPTION_SHARE = 0.01  # то же для объёма (порог рабочего чата, решение мастера не нужно)
 PRICE_TOL = 1e-9
 VOLUME_TOL = 1e-6
 _DAY_MS = 86_400_000
@@ -282,6 +291,8 @@ class CrossCheckReport:
     first_ts: int | None = None
     last_ts: int | None = None
     mismatched: int = 0  # крупных свечей с расхождением хотя бы в одном поле
+    mismatched_ohlc: int = 0  # из них с расхождением в OHLC
+    mismatched_volume: int = 0  # из них с расхождением в объёме
     by_field: dict[str, int] = field(default_factory=dict)
     max_abs: dict[str, float] = field(default_factory=dict)
     examples: list[str] = field(default_factory=list)
@@ -289,6 +300,24 @@ class CrossCheckReport:
     @property
     def ok(self) -> bool:
         return self.compared > 0 and self.mismatched == 0
+
+    @property
+    def ohlc_share(self) -> float:
+        return self.mismatched_ohlc / self.compared if self.compared else 0.0
+
+    @property
+    def volume_share(self) -> float:
+        return self.mismatched_volume / self.compared if self.compared else 0.0
+
+    @property
+    def severity(self) -> Literal["ok", "warning", "error"]:
+        """ok: расхождений нет (или сравнивать нечего); warning: допустимые исключения;
+        error: расхождений больше порогов."""
+        if self.mismatched == 0:
+            return "ok"
+        if self.ohlc_share >= OHLC_EXCEPTION_SHARE or self.volume_share >= VOLUME_EXCEPTION_SHARE:
+            return "error"
+        return "warning"
 
 
 _FIELDS = ("open", "high", "low", "close", "volume")
@@ -345,7 +374,11 @@ def cross_check(
                 diffs.append(f"{name}: {fine_tf}-агрегат {built:g}, {coarse_tf} {native:g}")
         if diffs:
             report.mismatched += 1
-            if len(report.examples) < MAX_EXAMPLES:
+            if any(not d.startswith("volume") for d in diffs):
+                report.mismatched_ohlc += 1
+            if any(d.startswith("volume") for d in diffs):
+                report.mismatched_volume += 1
+            if len(report.examples) < MAX_CROSS_EXAMPLES:
                 report.examples.append(f"{_utc(big.ts_open)}: " + "; ".join(diffs))
     return report
 
@@ -377,10 +410,16 @@ def cross_summary_line(report: CrossCheckReport) -> str:
         f"{head}: сверено {report.compared} свечей, "
         f"пропущено без мелких {report.skipped_no_fine}, неполных {report.skipped_incomplete}"
     )
-    if report.ok:
+    if report.mismatched == 0:
         return base + ": расхождений нет"
+    detail = (
+        f"OHLC в {report.mismatched_ohlc} барах ({report.ohlc_share * 100:.3f} %), "
+        f"объём в {report.mismatched_volume} барах ({report.volume_share * 100:.3f} %)"
+    )
+    if report.severity == "warning":
+        return base + f": допустимые исключения (предупреждение): {detail}"
     fields = ", ".join(f"{k} ×{v}" for k, v in report.by_field.items())
-    return base + f": РАСХОЖДЕНИЯ в {report.mismatched} свечах ({fields})"
+    return base + f": РАСХОЖДЕНИЯ: {detail} ({fields})"
 
 
 def render_markdown(
@@ -391,8 +430,10 @@ def render_markdown(
     data_dir: Path,
     version: str,
 ) -> str:
-    errors = sum(len(s.errors) for s in series) + sum(1 for c in crosses if c.mismatched)
-    warnings = sum(len(s.warnings) for s in series)
+    errors = sum(len(s.errors) for s in series) + sum(1 for c in crosses if c.severity == "error")
+    warnings = sum(len(s.warnings) for s in series) + sum(
+        1 for c in crosses if c.severity == "warning"
+    )
     lines = [
         "# Отчёт о качестве данных SqueezeLab",
         "",
@@ -449,13 +490,24 @@ def render_markdown(
             "- Правило: open первой, close последней, max high, min low, сумма объёма; допуск цены "
             f"{PRICE_TOL:g}, объёма {VOLUME_TOL:g}"
         )
-        if x.ok:
+        if x.mismatched == 0:
             lines.append("- Результат: **расхождений нет**")
             continue
-        lines.append(f"- Результат: **расхождения в {x.mismatched} свечах**")
+        verdict = (
+            "допустимые исключения (предупреждение)"
+            if x.severity == "warning"
+            else "РАСХОЖДЕНИЯ больше порогов"
+        )
+        lines.append(
+            f"- Результат: **{verdict}**: OHLC в {x.mismatched_ohlc} барах "
+            f"({x.ohlc_share * 100:.3f} %, порог {OHLC_EXCEPTION_SHARE * 100:.1f} %), объём в "
+            f"{x.mismatched_volume} барах ({x.volume_share * 100:.3f} %, порог "
+            f"{VOLUME_EXCEPTION_SHARE * 100:.0f} %)"
+        )
         lines += ["", "| Поле | Свечей с расхождением | Наибольшее отклонение |", "|---|---|---|"]
         for name in _FIELDS:
             if name in x.by_field:
                 lines.append(f"| {name} | {x.by_field[name]} | {x.max_abs[name]:g} |")
-        lines += ["", "Примеры:", ""] + [f"- {e}" for e in x.examples]
+        lines += ["", f"Список расхождений (первые {len(x.examples)}):", ""]
+        lines += [f"- {e}" for e in x.examples]
     return "\n".join(lines) + "\n"

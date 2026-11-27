@@ -622,8 +622,10 @@ def cmd_data_check(args: argparse.Namespace) -> int:
         print(f"ОШИБКА: не удалось записать отчёт: {exc}", file=sys.stderr)
         return EXIT_FAILURE
 
-    problems = sum(len(s.errors) for s in series) + sum(1 for c in crosses if c.mismatched)
-    warnings = sum(len(s.warnings) for s in series)
+    problems = sum(len(s.errors) for s in series) + sum(1 for c in crosses if c.severity == "error")
+    warnings = sum(len(s.warnings) for s in series) + sum(
+        1 for c in crosses if c.severity == "warning"
+    )
     print(f"\nОтчёт: {path}")
     if problems:
         print(
